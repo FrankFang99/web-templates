@@ -6,7 +6,7 @@
 <title>BYON-style 流体丝绸 · 模板 001 v4</title>
 <style>
   :root {
-    --bg: #d0d4da;
+    --bg: #dfe3e9;
     --text: #1a1d22;
     --text-muted: rgba(26, 29, 34, 0.55);
   }
@@ -266,23 +266,94 @@ void main() {
   fragColor = vec4(v, 0.0, 1.0);
 }`
 
-// 6) Render — vel.length → pow 放大 → 调色板查色 → mix(bgColor, color, length)
+// 6) Render — v5.2：把速度场当 3D 表面 → 平滑 normal → 软高光 → 阴影
+// 速度大小 = 高度，速度梯度 = 法线 → Phong 光照自然产生阴影
+// v5.2: 加大 normal 采样距离（3x uPx）+ 13 邻域平均，让纹理更"丝绸"
 const FS_RENDER = `#version 300 es
 precision highp float;
 uniform sampler2D uVelocity;
 uniform sampler2D uPalette;
 uniform vec4 uBgColor;
+uniform vec2 uPx;
 in vec2 vUv;
 out vec4 fragColor;
+
+float getH(vec2 uv) {
+  return length(texture(uVelocity, uv).xy);
+}
+
 void main() {
-  vec2 vel = texture(uVelocity, vUv).xy;
-  float lenv = clamp(length(vel), 0.0, 1.0);
-  // pow 0.5 = 平方根放大，让小速度值也有可见对比
+  // === 1. 速度场 → 高度场（中心 + 8 邻域平均 → 平滑 normal）===
+  // 步长 3 像素 = 更柔的 normal
+  float STEP = 3.0;
+  vec2 dx = vec2(uPx.x * STEP, 0.0);
+  vec2 dy = vec2(0.0, uPx.y * STEP);
+
+  // 9 点平均（更平滑的 h_c）
+  float h_c = (
+    getH(vUv) * 4.0 +
+    getH(vUv + dx) + getH(vUv - dx) +
+    getH(vUv + dy) + getH(vUv - dy) +
+    (getH(vUv + dx + dy) + getH(vUv - dx + dy) +
+     getH(vUv + dx - dy) + getH(vUv - dx - dy)) * 0.5
+  ) / 12.0;
+
+  // Sobel 算 normal（更宽采样）
+  float h_l = getH(vUv - dx);
+  float h_r = getH(vUv + dx);
+  float h_u = getH(vUv - dy);
+  float h_d = getH(vUv + dy);
+  float h_lu = getH(vUv - dx - dy);
+  float h_ru = getH(vUv + dx - dy);
+  float h_ld = getH(vUv - dx + dy);
+  float h_rd = getH(vUv + dx + dy);
+
+  vec2 normal = vec2(
+    (h_ru + 2.0 * h_r + h_rd) - (h_lu + 2.0 * h_l + h_ld),
+    (h_ld + 2.0 * h_d + h_rd) - (h_lu + 2.0 * h_u + h_ru)
+  );
+  // normal 坡度（1.8x = 强烈但不夸张）
+  normal = normalize(normal * 1.8 + vec2(0.00001));
+
+  // === 2. 多光源 ===
+  vec2 light1 = normalize(vec2(0.5, 0.7));   // 主光：右上
+  vec2 light2 = normalize(vec2(-0.4, -0.2));  // 补光：左下
+
+  // Lambert + Half-Lambert 混合（避免纯黑，也有对比）
+  float diff1 = max(0.0, dot(normal, light1));
+  float diffHalf = dot(normal, light1) * 0.5 + 0.5;  // 0-1
+  float diff2 = max(0.0, dot(normal, light2)) * 0.25;
+
+  // Blinn-Phong 高光（柔 + 亮）
+  vec2 viewDir = vec2(0.0, 1.0);
+  vec2 half1 = normalize(light1 + viewDir);
+  float spec1 = pow(max(0.0, dot(normal, half1)), 18.0);
+  float spec2 = pow(max(0.0, dot(normal, normalize(light2 + viewDir))), 22.0) * 0.4;
+  float spec = spec1 + spec2;
+
+  // === 3. 颜色合成 ===
+  float lenv = clamp(h_c, 0.0, 1.0);
   lenv = pow(lenv, 0.5);
-  vec3 c = texture(uPalette, vec2(lenv, 0.5)).rgb;
-  vec3 outRGB = mix(uBgColor.rgb, c, lenv);
-  float outA = mix(uBgColor.a, 1.0, lenv);
-  fragColor = vec4(outRGB, outA);
+
+  vec3 paletteColor = texture(uPalette, vec2(lenv, 0.5)).rgb;
+
+  // 暗色：比 bg 略深（35% 暗）—— byonlab 那种深色
+  vec3 shadowColor = uBgColor.rgb * 0.65;
+
+  // 关键：只在 lenv 大（silk 区域）才应用 3D 阴影，bg 区域保持原色
+  // 阴影权重 = lenv * 0.7（silk 边缘 70% 阴影强度，中心更亮）
+  float shadowWeight = lenv * 0.7;
+
+  // 漫反射：暗区（diff 小）→ shadow，亮区（diff 大）→ palette
+  vec3 litByDiff = mix(shadowColor, paletteColor, lenv);
+  // 用 diffHalf 进一步控制亮度（normals 朝向光 → 更亮）
+  vec3 finalColor = mix(uBgColor.rgb, litByDiff * (0.7 + diff1 * 0.5), shadowWeight + 0.3);
+  // 加高光
+  finalColor += spec * 0.55 * lenv;
+
+  // alpha
+  float alpha = mix(uBgColor.a, 1.0, lenv * 0.6 + spec * 0.4);
+  fragColor = vec4(finalColor, alpha);
 }`
 
 // ========== 调色板：bg 灰 → 中亮 → 极亮白（高对比让 silk 可见）==========
@@ -527,8 +598,10 @@ function render() {
   gl.bindTexture(gl.TEXTURE_2D, palette)
   gl.uniform1i(gl.getUniformLocation(programs.render, 'uVelocity'), 0)
   gl.uniform1i(gl.getUniformLocation(programs.render, 'uPalette'), 1)
-  // bgColor 跟 CSS body 保持一致（#e8ebef ≈ 232/255, 235/255, 239/255, 1.0）
-  gl.uniform4f(gl.getUniformLocation(programs.render, 'uBgColor'), 208/255, 212/255, 218/255, 1.0)
+  gl.uniform2f(gl.getUniformLocation(programs.render, 'uPx'),
+    1.0 / vel.read.width, 1.0 / vel.read.height)
+  // bgColor 跟 CSS body 保持一致（#dfe3e9 = 223/255, 227/255, 233/255）
+  gl.uniform4f(gl.getUniformLocation(programs.render, 'uBgColor'), 223/255, 227/255, 233/255, 1.0)
   gl.bindFramebuffer(gl.FRAMEBUFFER, null)
   gl.viewport(0, 0, W, H)
   gl.bindVertexArray(quadVAO)
