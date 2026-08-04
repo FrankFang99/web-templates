@@ -28,7 +28,9 @@
 
 | # | 名称 | 效果 | 适用 | 文件夹 |
 |---|---|---|---|---|
-| 001 | BYON 丝绸布料 | 鼠标移动 → 丝绸布料在鼠标位置被按下 + 涟漪扩散（银白丝绸 / 暗色 / 金色变体） | 浅色 + 高级感首屏 / 创意社区 | [byonlab-liquid-metal](./byonlab-liquid-metal/) |
+| 001 | BYON 丝绸布料 v5.2 | 鼠标移动 → 3D 丝绸流体跟随 + Phong 光照明暗 | 浅色 + 高级感首屏 / 创意社区 | [byonlab-liquid-metal](./byonlab-liquid-metal/) |
+| 001 | v5.2 4 联预览 | 不同鼠标位置 + 3D 立体效果 | 看不同视角 | [preview-grid-v2.png](./byonlab-liquid-metal/preview-grid-v2.png) |
+| 001 | v5.2 vs byonlab 原版对比 | 进步路线 v4 → v5.1 → v5.2 | 看 3D 突破 | [preview-compare-v2.png](./byonlab-liquid-metal/preview-compare-v2.png) |
 
 ---
 
