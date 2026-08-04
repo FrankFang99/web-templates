@@ -3,11 +3,11 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>BYON-style 液态金属 · 模板 001</title>
+<title>BYON-style 丝绸布料 · 模板 001 v2</title>
 <style>
   :root {
-    --bg-top: #f5f6f8;
-    --bg-bot: #e2e6ec;
+    --bg-top: #f4f5f7;
+    --bg-bot: #d8dce3;
     --text: #1a1d22;
     --text-muted: rgba(26, 29, 34, 0.55);
     --accent: #2d4753;
@@ -21,7 +21,6 @@
     cursor: crosshair;
   }
 
-  /* HUD overlay — 顶部导航 + 居中标题 + 底部输入 */
   .hud { position: fixed; inset: 0; pointer-events: none; z-index: 10; }
   .hud > * { pointer-events: auto; }
 
@@ -58,7 +57,7 @@
 
   .side-tip { position: absolute; bottom: 80px; right: 24px; font-size: 12px; color: var(--text-muted); font-family: monospace; }
 
-  canvas { position: fixed; inset: 0; z-index: 1; }
+  canvas { position: fixed; inset: 0; z-index: 1; display: block; }
 </style>
 </head>
 <body>
@@ -95,139 +94,174 @@
 <script type="module">
 import * as THREE from 'three';
 
-// ============ 场景：全屏正交相机 + 一个 plane 跑 metaball shader ============
+// ============ 场景：透视相机 + 高细分 plane 布料 ============
 const canvas = document.getElementById('c')
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true })
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5))
+renderer.setClearColor(0x000000, 0)  // 透明，让 body 渐变透出来
 
 const scene = new THREE.Scene()
-const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1)
+const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100)
+camera.position.set(0, -1.5, 4.5)
+camera.lookAt(0, 0, 0)
 
-// 全屏 quad
-const geo = new THREE.PlaneGeometry(2, 2)
+// 高级细 plane —— 256x192 = 49152 顶点，足够细腻
+const PLANE_W = 10
+const PLANE_H = 6
+const SEG_W = 256
+const SEG_H = 192
+const geo = new THREE.PlaneGeometry(PLANE_W, PLANE_H, SEG_W, SEG_H)
 
-// ============ 鼠标追踪 ============
-const mouse = new THREE.Vector2(0, 0)         // 归一化 -1 ~ 1
-const mouseTarget = new THREE.Vector2(0, 0)   // 目标位置（GSAP-like 插值目标）
+// ============ Uniforms ============
+const uMouse = new THREE.Vector2(0.5, 0.5)       // 当前鼠标位置 (0-1)
+const uMouseTarget = new THREE.Vector2(0.5, 0.5)  // 目标位置（lerp）
 
-window.addEventListener('mousemove', (e) => {
-  mouseTarget.x = (e.clientX / window.innerWidth) * 2 - 1
-  mouseTarget.y = -((e.clientY / window.innerHeight) * 2 - 1)
-})
-
-// ============ 5 个 metaball 球的位置（uniform） ============
-// 0: 中心（轻微漂移）  1-2: 跟随鼠标  3-4: 慢漂装饰球
-const ballCount = 5
-const uBalls = new Float32Array(ballCount * 2)   // x, y
-
-// Shader uniforms
 const uniforms = {
   uTime: { value: 0 },
+  uMouse: { value: new THREE.Vector2(0.5, 0.5) },
+  uPlaneSize: { value: new THREE.Vector2(PLANE_W, PLANE_H) },
   uResolution: { value: new THREE.Vector2(1, 1) },
-  uBalls: { value: uBalls },
-  uBallCount: { value: ballCount },
-  uSmoothK: { value: 0.55 },          // metaball 融合半径（更大 = 更液态）
-  uColorIn: { value: new THREE.Color('#9aa2ad') },    // 球内中灰（暗部）
-  uColorOut: { value: new THREE.Color('#f0f2f5') },   // 球外浅色
-  uColorHighlight: { value: new THREE.Color('#ffffff') }, // 高光纯白
+  uColorBase: { value: new THREE.Color('#eef0f3') },
+  uColorShadow: { value: new THREE.Color('#a8aeba') },
+  uColorHighlight: { value: new THREE.Color('#ffffff') },
+  uMouseStrength: { value: 1.0 },
 }
 
-// ============ Vertex Shader ============
+// ============ Mouse tracking ============
+window.addEventListener('mousemove', (e) => {
+  uMouseTarget.x = e.clientX / window.innerWidth
+  uMouseTarget.y = 1.0 - (e.clientY / window.innerHeight)  // flip Y
+})
+
+// ============ Vertex shader：基础 FBM 噪声 + 鼠标下压 + 涟漪 ============
 const vsh = `
+#define SEG_W ${SEG_W}
+#define SEG_H ${SEG_H}
+precision highp float;
+
+uniform float uTime;
+uniform vec2 uMouse;
+uniform vec2 uPlaneSize;
+uniform float uMouseStrength;
+
 varying vec2 vUv;
+varying vec3 vNormal;
+varying float vDepth;
+varying float vMouseDist;
+
+// 哈希 + 值噪声
+float hash(vec2 p) {
+  p = fract(p * vec2(123.34, 456.21));
+  p += dot(p, p + 45.32);
+  return fract(p.x * p.y);
+}
+float noise(vec2 p) {
+  vec2 i = floor(p);
+  vec2 f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  float a = hash(i);
+  float b = hash(i + vec2(1.0, 0.0));
+  float c = hash(i + vec2(0.0, 1.0));
+  float d = hash(i + vec2(1.0, 1.0));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+// FBM 4 层
+float fbm(vec2 p) {
+  float v = 0.0;
+  float a = 0.5;
+  for (int i = 0; i < 4; i++) {
+    v += a * noise(p);
+    p *= 2.07;
+    a *= 0.5;
+  }
+  return v;
+}
+
+// 计算总位移 = 基础褶皱 + 鼠标下压 + 涟漪扩散
+float displacement(vec2 uv) {
+  // 1) 基础褶皱：低频 FBM 模拟布料自然皱褶（幅度温和，silk 感）
+  float baseFolds = (fbm(uv * 2.0 + vec2(uTime * 0.05, uTime * 0.04)) - 0.5) * 0.28
+                  + (fbm(uv * 4.5 - vec2(uTime * 0.03, uTime * 0.035)) - 0.5) * 0.14
+                  + (fbm(uv * 9.0 + vec2(uTime * 0.02, -uTime * 0.025)) - 0.5) * 0.06;
+
+  // 2) 鼠标下压：中心有深谷，Gaussian（要看得见按下去）
+  vec2 mouseUV = uMouse;
+  vec2 d = (uv - mouseUV) * vec2(uPlaneSize.x / uPlaneSize.y, 1.0);
+  float dist = length(d);
+  float dip = -uMouseStrength * exp(-dist * dist * 4.0) * 1.2;
+
+  // 3) 鼠标涟漪：从鼠标向外扩散的波
+  float ripple = sin(dist * 12.0 - uTime * 3.0) * exp(-dist * 3.5) * 0.08;
+
+  return baseFolds + dip + ripple;
+}
+
 void main() {
   vUv = uv;
-  gl_Position = vec4(position, 1.0);
+  vec3 pos = position;
+
+  // 计算 z 位移
+  float d = displacement(uv);
+  pos.z = d;
+
+  // 计算鼠标距离（fragment 用）
+  vMouseDist = length((uv - uMouse) * vec2(uPlaneSize.x / uPlaneSize.y, 1.0));
+  vDepth = d;
+
+  // 法线：在 UV 空间对 d 求偏导，再用偏导构造扰动法线
+  float e = 0.003;
+  float dX1 = displacement(uv + vec2(e, 0.0));
+  float dX0 = displacement(uv - vec2(e, 0.0));
+  float dY1 = displacement(uv + vec2(0.0, e));
+  float dY0 = displacement(uv - vec2(0.0, e));
+  // 因为 plane 在 XY 面、z 是高度，normal = normalize(cross(tangentX, tangentY))
+  vec3 tangentX = vec3(2.0 * e * (uPlaneSize.x / float(SEG_W)), 0.0, dX1 - dX0);
+  vec3 tangentY = vec3(0.0, 2.0 * e * (uPlaneSize.y / float(SEG_H)), dY1 - dY0);
+  vNormal = normalize(cross(tangentX, tangentY));
+
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
 }
 `
 
-// ============ Fragment Shader ============
+// ============ Fragment shader：柔光 + 边缘阴影 + 鼠标高光 ============
 const fsh = `
 precision highp float;
-uniform float uTime;
-uniform vec2 uResolution;
-uniform float uBalls[${ballCount * 2}];
-uniform int uBallCount;
-uniform float uSmoothK;
-uniform vec3 uColorIn;
-uniform vec3 uColorOut;
+
+uniform vec3 uColorBase;
+uniform vec3 uColorShadow;
 uniform vec3 uColorHighlight;
+uniform vec2 uMouse;
+uniform vec2 uPlaneSize;
+uniform float uMouseStrength;
+
 varying vec2 vUv;
-
-// 平滑最小值（核心：让两个球的距离场平滑融合 = 液态感）
-float smin(float a, float b, float k) {
-  float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
-  return mix(b, a, h) - k * h * (1.0 - h);
-}
-
-// 单球距离场（中心在 cx,cy 半径 r=0.18）
-float ballSDF(vec2 p, vec2 c) {
-  return length(p - c) - 0.18;
-}
-
-// 总距离场（所有球 smin 融合）
-float sceneSDF(vec2 p) {
-  float d = 1e10;
-  for (int i = 0; i < ${ballCount}; i++) {
-    vec2 c = vec2(uBalls[i*2], uBalls[i*2+1]);
-    d = smin(d, ballSDF(p, c), uSmoothK);
-  }
-  return d;
-}
+varying vec3 vNormal;
+varying float vDepth;
+varying float vMouseDist;
 
 void main() {
-  // 归一化到 [-1, 1] 并按宽高比修正
-  vec2 p = (vUv - 0.5) * 2.0;
-  p.x *= uResolution.x / uResolution.y;
+  // 软光照（主光从左上）—— 用半 lambert，silk 不需要硬阴影
+  vec3 lightDir = normalize(vec3(-0.5, 0.7, 0.6));
+  float NdotL = dot(vNormal, lightDir);
+  float diff = max(0.0, NdotL * 0.55 + 0.55);  // 半 lambert（柔）
 
-  float d = sceneSDF(p);
-
-  // 球内/球外判定
-  float inside = step(d, 0.0);
-
-  // 法线计算（用距离场梯度）
-  vec2 e = vec2(0.001, 0.0);
-  float dx = sceneSDF(p + e.xy) - sceneSDF(p - e.xy);
-  float dy = sceneSDF(p + e.yx) - sceneSDF(p - e.yx);
-  vec3 normal = normalize(vec3(dx, dy, 0.5));   // 0.5 = 假 z 分量（控制高光强度）
-
-  // 光照：左上主光 + 右上补光 + 顶光
-  vec3 light1 = normalize(vec3(-0.7, 0.6, 1.0));   // 主光（左上、倾斜）
-  vec3 light2 = normalize(vec3( 0.6, 0.4, 0.7));   // 补光（右上）
-  vec3 light3 = normalize(vec3( 0.0, 1.0, 0.5));   // 顶光
-  float diff1 = max(0.0, dot(normal, light1));
-  float diff2 = max(0.0, dot(normal, light2));
-  float diff3 = max(0.0, dot(normal, light3));
-  // 主光为主，造强对比
-  float diff  = diff1 * 1.0 + diff2 * 0.4 + diff3 * 0.3;
-
-  // 高光（specular）—— 锐利 + 多角度
+  // 顶光（从相机方向，给正面打光）
   vec3 viewDir = vec3(0.0, 0.0, 1.0);
-  vec3 halfV1  = normalize(light1 + viewDir);
-  float spec1  = pow(max(0.0, dot(normal, halfV1)), 200.0);
-  vec3 halfV2  = normalize(light2 + viewDir);
-  float spec2  = pow(max(0.0, dot(normal, halfV2)), 100.0);
-  vec3 halfV3  = normalize(light3 + viewDir);
-  float spec3  = pow(max(0.0, dot(normal, halfV3)), 60.0);
-  float spec   = spec1 * 1.8 + spec2 * 1.0 + spec3 * 0.4;
+  float NdotV = max(0.0, dot(vNormal, viewDir));
+  float topLight = pow(NdotV, 1.0) * 0.35;
 
-  // Fresnel 边缘亮（金属球边缘反光强）
-  float fres = pow(1.0 - max(0.0, normal.z), 2.0);
+  // 软高光（很淡，silk 才会有的微微光泽）
+  vec3 halfV = normalize(lightDir + viewDir);
+  float spec = pow(max(0.0, dot(vNormal, halfV)), 18.0) * 0.25;
 
-  // 基础金属色：外浅 → 内更深（凹陷处暗）
-  float t = smoothstep(0.0, 0.4, abs(d));
-  vec3 base = mix(uColorIn, uColorOut, t);
+  // 鼠标周围一圈微微高光（突出交互点）
+  float mouseRing = exp(-vMouseDist * vMouseDist * 14.0) * 0.3;
 
-  // 球内：金属反射（暗部更深 + 强高光 + 强 fresnel）
-  vec3 metal = base * (0.5 + 0.5 * diff) + uColorHighlight * spec + uColorHighlight * fres * 0.55;
-
-  // 球外：背景（transparent / 透出 body gradient）
-  vec3 col = mix(base, metal, inside);
-
-  // 边缘抗锯齿（fwidth）
-  float aa = fwidth(d) * 1.5;
-  float edge = smoothstep(-aa, aa, d);
-  col = mix(metal, base, edge);
+  // 基础色：根据光照 mix
+  vec3 col = mix(uColorShadow, uColorBase, diff);
+  col += uColorBase * topLight;
+  col += uColorHighlight * spec;
+  col += uColorHighlight * mouseRing;
 
   gl_FragColor = vec4(col, 1.0);
 }
@@ -237,46 +271,33 @@ const mat = new THREE.ShaderMaterial({
   uniforms,
   vertexShader: vsh,
   fragmentShader: fsh,
-  glslVersion: THREE.GLSL1,
+  side: THREE.DoubleSide,  // 布料背面也渲染（顶部看下去会透）
 })
 
 const mesh = new THREE.Mesh(geo, mat)
 scene.add(mesh)
 
-// ============ 调整大小 ============
+// ============ Resize ============
 function resize() {
   const w = window.innerWidth
   const h = window.innerHeight
   renderer.setSize(w, h, false)
+  camera.aspect = w / h
+  camera.updateProjectionMatrix()
   uniforms.uResolution.value.set(w, h)
 }
 resize()
 window.addEventListener('resize', resize)
 
-// ============ 动画循环 ============
+// ============ Animation loop ============
 const clock = new THREE.Clock()
 function tick() {
   const t = clock.getElapsedTime()
 
-  // 鼠标平滑插值（lerp 让跟随有"重量感"，不抖动）
-  mouse.x += (mouseTarget.x - mouse.x) * 0.06
-  mouse.y += (mouseTarget.y - mouse.y) * 0.06
-
-  // 0: 中心球（轻微呼吸 + 缓慢漂移）
-  uBalls[0] = Math.sin(t * 0.3) * 0.15
-  uBalls[1] = Math.cos(t * 0.4) * 0.08
-
-  // 1-2: 跟随鼠标的双球（错位跟随，看起来像尾巴/头部分离）
-  uBalls[2] = mouse.x * 0.9 + Math.sin(t * 1.2) * 0.05
-  uBalls[3] = mouse.y * 0.7 + Math.cos(t * 0.9) * 0.05
-  uBalls[4] = mouse.x * 0.5 - Math.sin(t * 1.5) * 0.08
-  uBalls[5] = mouse.y * 0.4 - Math.cos(t * 1.1) * 0.04
-
-  // 3-4: 装饰慢漂球
-  uBalls[6] = Math.cos(t * 0.25) * 1.1
-  uBalls[7] = Math.sin(t * 0.35) * 0.6 + 0.2
-  uBalls[8] = Math.sin(t * 0.18) * 0.9 - 0.3
-  uBalls[9] = Math.cos(t * 0.22) * 0.7 - 0.2
+  // 鼠标 lerp（跟手重量）
+  uMouse.x += (uMouseTarget.x - uMouse.x) * 0.08
+  uMouse.y += (uMouseTarget.y - uMouse.y) * 0.08
+  uniforms.uMouse.value.copy(uMouse)
 
   uniforms.uTime.value = t
   renderer.render(scene, camera)
