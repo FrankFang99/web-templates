@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>BYON-style 液态金属 · 模板 001</title>
+<style>
+  :root {
+    --bg-top: #f5f6f8;
+    --bg-bot: #e2e6ec;
+    --text: #1a1d22;
+    --text-muted: rgba(26, 29, 34, 0.55);
+    --accent: #2d4753;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 100%; height: 100%; overflow: hidden; }
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+    background: linear-gradient(180deg, var(--bg-top) 0%, var(--bg-bot) 100%);
+    color: var(--text);
+    cursor: crosshair;
+  }
+
+  /* HUD overlay — 顶部导航 + 居中标题 + 底部输入 */
+  .hud { position: fixed; inset: 0; pointer-events: none; z-index: 10; }
+  .hud > * { pointer-events: auto; }
+
+  .nav {
+    position: absolute; top: 0; left: 0; right: 0;
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 24px 40px;
+  }
+  .logo { display: flex; align-items: center; gap: 8px; font-weight: 700; font-size: 18px; letter-spacing: 0.02em; }
+  .logo::before { content: ''; width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--text); }
+  .nav-links { display: flex; gap: 32px; font-size: 14px; color: var(--text-muted); }
+  .nav-links a { color: inherit; text-decoration: none; transition: color 0.2s; }
+  .nav-links a:hover { color: var(--text); }
+  .nav-cta { padding: 8px 18px; border: 1px solid var(--text); border-radius: 6px; font-size: 14px; font-weight: 500; }
+
+  .hero { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center; max-width: 720px; padding: 0 24px; }
+  .eyebrow { font-size: 13px; color: var(--text-muted); margin-bottom: 12px; letter-spacing: 0.05em; }
+  .title { font-family: 'Times New Roman', 'Source Han Serif', serif; font-style: italic; font-size: clamp(36px, 5vw, 64px); font-weight: 500; line-height: 1.1; letter-spacing: -0.02em; margin-bottom: 16px; }
+  .desc { font-size: 15px; color: var(--text-muted); line-height: 1.6; }
+
+  .input-bar {
+    position: absolute; bottom: 32px; left: 50%; transform: translateX(-50%);
+    display: flex; align-items: center; gap: 12px;
+    background: rgba(255, 255, 255, 0.7);
+    backdrop-filter: blur(12px);
+    border: 1px solid rgba(0, 0, 0, 0.08);
+    border-radius: 100px;
+    padding: 8px 8px 8px 24px;
+    width: min(720px, calc(100% - 48px));
+  }
+  .input-bar input { flex: 1; background: transparent; border: none; outline: none; font-size: 14px; color: var(--text); }
+  .input-bar input::placeholder { color: var(--text-muted); }
+  .input-bar button { width: 36px; height: 36px; border-radius: 50%; background: var(--text); color: #fff; border: none; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+
+  .side-tip { position: absolute; bottom: 80px; right: 24px; font-size: 12px; color: var(--text-muted); font-family: monospace; }
+
+  canvas { position: fixed; inset: 0; z-index: 1; }
+</style>
+</head>
+<body>
+
+<canvas id="c"></canvas>
+
+<div class="hud">
+  <nav class="nav">
+    <div class="logo">BYON</div>
+    <div class="nav-links">
+      <a href="#">项目</a><a href="#">场次</a><a href="#">社区</a><a href="#">关于</a>
+    </div>
+    <a href="#" class="nav-cta">进入 BYON</a>
+  </nav>
+
+  <div class="hero">
+    <div class="eyebrow">空载社区</div>
+    <h1 class="title">Bring Your Own Nothing.</h1>
+    <p class="desc">这是一个开放的 AI 创造社区。<br>你可以在此独立想法、表达需求、寻找同伴，<br>也可以把尚未完成的产品，直接交给世界验证。</p>
+  </div>
+
+  <div class="side-tip">move your mouse</div>
+
+  <form class="input-bar" onsubmit="event.preventDefault()">
+    <input type="text" placeholder="登录后参与讨论" />
+    <button aria-label="lock"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg></button>
+  </form>
+</div>
+
+<script type="importmap">
+{ "imports": { "three": "https://esm.sh/three@0.182.0" } }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+// ============ 场景：全屏正交相机 + 一个 plane 跑 metaball shader ============
+const canvas = document.getElementById('c')
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true })
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
+
+const scene = new THREE.Scene()
+const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1)
+
+// 全屏 quad
+const geo = new THREE.PlaneGeometry(2, 2)
+
+// ============ 鼠标追踪 ============
+const mouse = new THREE.Vector2(0, 0)         // 归一化 -1 ~ 1
+const mouseTarget = new THREE.Vector2(0, 0)   // 目标位置（GSAP-like 插值目标）
+
+window.addEventListener('mousemove', (e) => {
+  mouseTarget.x = (e.clientX / window.innerWidth) * 2 - 1
+  mouseTarget.y = -((e.clientY / window.innerHeight) * 2 - 1)
+})
+
+// ============ 5 个 metaball 球的位置（uniform） ============
+// 0: 中心（轻微漂移）  1-2: 跟随鼠标  3-4: 慢漂装饰球
+const ballCount = 5
+const uBalls = new Float32Array(ballCount * 2)   // x, y
+
+// Shader uniforms
+const uniforms = {
+  uTime: { value: 0 },
+  uResolution: { value: new THREE.Vector2(1, 1) },
+  uBalls: { value: uBalls },
+  uBallCount: { value: ballCount },
+  uSmoothK: { value: 0.55 },          // metaball 融合半径（更大 = 更液态）
+  uColorIn: { value: new THREE.Color('#9aa2ad') },    // 球内中灰（暗部）
+  uColorOut: { value: new THREE.Color('#f0f2f5') },   // 球外浅色
+  uColorHighlight: { value: new THREE.Color('#ffffff') }, // 高光纯白
+}
+
+// ============ Vertex Shader ============
+const vsh = `
+varying vec2 vUv;
+void main() {
+  vUv = uv;
+  gl_Position = vec4(position, 1.0);
+}
+`
+
+// ============ Fragment Shader ============
+const fsh = `
+precision highp float;
+uniform float uTime;
+uniform vec2 uResolution;
+uniform float uBalls[${ballCount * 2}];
+uniform int uBallCount;
+uniform float uSmoothK;
+uniform vec3 uColorIn;
+uniform vec3 uColorOut;
+uniform vec3 uColorHighlight;
+varying vec2 vUv;
+
+// 平滑最小值（核心：让两个球的距离场平滑融合 = 液态感）
+float smin(float a, float b, float k) {
+  float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+  return mix(b, a, h) - k * h * (1.0 - h);
+}
+
+// 单球距离场（中心在 cx,cy 半径 r=0.18）
+float ballSDF(vec2 p, vec2 c) {
+  return length(p - c) - 0.18;
+}
+
+// 总距离场（所有球 smin 融合）
+float sceneSDF(vec2 p) {
+  float d = 1e10;
+  for (int i = 0; i < ${ballCount}; i++) {
+    vec2 c = vec2(uBalls[i*2], uBalls[i*2+1]);
+    d = smin(d, ballSDF(p, c), uSmoothK);
+  }
+  return d;
+}
+
+void main() {
+  // 归一化到 [-1, 1] 并按宽高比修正
+  vec2 p = (vUv - 0.5) * 2.0;
+  p.x *= uResolution.x / uResolution.y;
+
+  float d = sceneSDF(p);
+
+  // 球内/球外判定
+  float inside = step(d, 0.0);
+
+  // 法线计算（用距离场梯度）
+  vec2 e = vec2(0.001, 0.0);
+  float dx = sceneSDF(p + e.xy) - sceneSDF(p - e.xy);
+  float dy = sceneSDF(p + e.yx) - sceneSDF(p - e.yx);
+  vec3 normal = normalize(vec3(dx, dy, 0.5));   // 0.5 = 假 z 分量（控制高光强度）
+
+  // 光照：左上主光 + 右上补光 + 顶光
+  vec3 light1 = normalize(vec3(-0.7, 0.6, 1.0));   // 主光（左上、倾斜）
+  vec3 light2 = normalize(vec3( 0.6, 0.4, 0.7));   // 补光（右上）
+  vec3 light3 = normalize(vec3( 0.0, 1.0, 0.5));   // 顶光
+  float diff1 = max(0.0, dot(normal, light1));
+  float diff2 = max(0.0, dot(normal, light2));
+  float diff3 = max(0.0, dot(normal, light3));
+  // 主光为主，造强对比
+  float diff  = diff1 * 1.0 + diff2 * 0.4 + diff3 * 0.3;
+
+  // 高光（specular）—— 锐利 + 多角度
+  vec3 viewDir = vec3(0.0, 0.0, 1.0);
+  vec3 halfV1  = normalize(light1 + viewDir);
+  float spec1  = pow(max(0.0, dot(normal, halfV1)), 200.0);
+  vec3 halfV2  = normalize(light2 + viewDir);
+  float spec2  = pow(max(0.0, dot(normal, halfV2)), 100.0);
+  vec3 halfV3  = normalize(light3 + viewDir);
+  float spec3  = pow(max(0.0, dot(normal, halfV3)), 60.0);
+  float spec   = spec1 * 1.8 + spec2 * 1.0 + spec3 * 0.4;
+
+  // Fresnel 边缘亮（金属球边缘反光强）
+  float fres = pow(1.0 - max(0.0, normal.z), 2.0);
+
+  // 基础金属色：外浅 → 内更深（凹陷处暗）
+  float t = smoothstep(0.0, 0.4, abs(d));
+  vec3 base = mix(uColorIn, uColorOut, t);
+
+  // 球内：金属反射（暗部更深 + 强高光 + 强 fresnel）
+  vec3 metal = base * (0.5 + 0.5 * diff) + uColorHighlight * spec + uColorHighlight * fres * 0.55;
+
+  // 球外：背景（transparent / 透出 body gradient）
+  vec3 col = mix(base, metal, inside);
+
+  // 边缘抗锯齿（fwidth）
+  float aa = fwidth(d) * 1.5;
+  float edge = smoothstep(-aa, aa, d);
+  col = mix(metal, base, edge);
+
+  gl_FragColor = vec4(col, 1.0);
+}
+`
+
+const mat = new THREE.ShaderMaterial({
+  uniforms,
+  vertexShader: vsh,
+  fragmentShader: fsh,
+  glslVersion: THREE.GLSL1,
+})
+
+const mesh = new THREE.Mesh(geo, mat)
+scene.add(mesh)
+
+// ============ 调整大小 ============
+function resize() {
+  const w = window.innerWidth
+  const h = window.innerHeight
+  renderer.setSize(w, h, false)
+  uniforms.uResolution.value.set(w, h)
+}
+resize()
+window.addEventListener('resize', resize)
+
+// ============ 动画循环 ============
+const clock = new THREE.Clock()
+function tick() {
+  const t = clock.getElapsedTime()
+
+  // 鼠标平滑插值（lerp 让跟随有"重量感"，不抖动）
+  mouse.x += (mouseTarget.x - mouse.x) * 0.06
+  mouse.y += (mouseTarget.y - mouse.y) * 0.06
+
+  // 0: 中心球（轻微呼吸 + 缓慢漂移）
+  uBalls[0] = Math.sin(t * 0.3) * 0.15
+  uBalls[1] = Math.cos(t * 0.4) * 0.08
+
+  // 1-2: 跟随鼠标的双球（错位跟随，看起来像尾巴/头部分离）
+  uBalls[2] = mouse.x * 0.9 + Math.sin(t * 1.2) * 0.05
+  uBalls[3] = mouse.y * 0.7 + Math.cos(t * 0.9) * 0.05
+  uBalls[4] = mouse.x * 0.5 - Math.sin(t * 1.5) * 0.08
+  uBalls[5] = mouse.y * 0.4 - Math.cos(t * 1.1) * 0.04
+
+  // 3-4: 装饰慢漂球
+  uBalls[6] = Math.cos(t * 0.25) * 1.1
+  uBalls[7] = Math.sin(t * 0.35) * 0.6 + 0.2
+  uBalls[8] = Math.sin(t * 0.18) * 0.9 - 0.3
+  uBalls[9] = Math.cos(t * 0.22) * 0.7 - 0.2
+
+  uniforms.uTime.value = t
+  renderer.render(scene, camera)
+  requestAnimationFrame(tick)
+}
+tick()
+</script>
+</body>
+</html>
