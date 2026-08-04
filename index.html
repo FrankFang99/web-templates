@@ -193,9 +193,8 @@ void main() {
   }
 }`
 
-// 2) External force —— v4 修复：用 uCenter 让力真正跟随鼠标
-// uCenter 范围 [-1, 1]（NDC 空间）
-// uScale 范围 (0, 1]（NDC 空间，作为刷子半径）
+// 2) External force —— v6 修复：用 Gaussian falloff（exp(-r²)）替代 d*d
+// 旧 d*d 在 r=1 边界处是 hard edge；Gaussian 永远平滑，silk 不会出碎纹
 const FS_EXTERNAL_FORCE = `#version 300 es
 precision highp float;
 uniform vec2 uForce;
@@ -206,9 +205,10 @@ out vec4 fragColor;
 void main() {
   vec2 ndc = (vUv - 0.5) * 2.0;
   vec2 offset = (ndc - uCenter) / max(uScale, vec2(0.0001));
-  float d = 1.0 - min(length(offset), 1.0);
-  d *= d;
-  fragColor = vec4(uForce * d, 0.0, 1.0);  // alpha=1 → additive blend 写入
+  float r2 = dot(offset, offset);
+  // Gaussian falloff: e^(-2.5*r²)，在 r=1 处约 8.2%，无 hard edge
+  float d = exp(-2.5 * r2);
+  fragColor = vec4(uForce * d, 0.0, 1.0);
 }`
 
 // 3) Divergence
@@ -246,13 +246,14 @@ void main() {
   fragColor = vec4(newP);
 }`
 
-// 5) Pressure gradient subtract
+// 5) Pressure gradient subtract（v6: 加 velocity drag，防止高频累积）
 const FS_GRADIENT_SUBTRACT = `#version 300 es
 precision highp float;
 uniform sampler2D uPressure;
 uniform sampler2D uVelocity;
 uniform vec2 uPx;
 uniform float uDt;
+uniform float uDrag;  // v6: 每帧衰减（0.985）
 in vec2 vUv;
 out vec4 fragColor;
 void main() {
@@ -263,12 +264,35 @@ void main() {
   vec2 v = texture(uVelocity, vUv).xy;
   vec2 gradP = vec2(p0 - p1, p2 - p3) * 0.5;
   v = v - gradP * uDt;
+  v *= uDrag;  // v6 drag
   fragColor = vec4(v, 0.0, 1.0);
 }`
 
-// 6) Render — v5.2：把速度场当 3D 表面 → 平滑 normal → 软高光 → 阴影
-// 速度大小 = 高度，速度梯度 = 法线 → Phong 光照自然产生阴影
-// v5.2: 加大 normal 采样距离（3x uPx）+ 13 邻域平均，让纹理更"丝绸"
+// 5.5) Velocity blur —— v6 抗碎纹关键
+// 对 velocity 做 9 点高斯模糊，让高频 noise 平滑
+// 输出到 velBlurred FBO，render 时读这个
+const FS_BLUR = `#version 300 es
+precision highp float;
+uniform sampler2D uVelocity;
+uniform vec2 uPx;
+in vec2 vUv;
+out vec4 fragColor;
+void main() {
+  // 9-tap Gaussian（中心 4x，4 邻 2x，4 对角 1x）
+  vec2 sum = texture(uVelocity, vUv).xy * 4.0;
+  sum += texture(uVelocity, vUv + vec2(uPx.x * 2.0, 0.0)).xy * 2.0;
+  sum += texture(uVelocity, vUv - vec2(uPx.x * 2.0, 0.0)).xy * 2.0;
+  sum += texture(uVelocity, vUv + vec2(0.0, uPx.y * 2.0)).xy * 2.0;
+  sum += texture(uVelocity, vUv - vec2(0.0, uPx.y * 2.0)).xy * 2.0;
+  sum += texture(uVelocity, vUv + uPx * 2.0).xy;
+  sum += texture(uVelocity, vUv - uPx * 2.0).xy;
+  sum += texture(uVelocity, vUv + vec2(uPx.x * 2.0, -uPx.y * 2.0)).xy;
+  sum += texture(uVelocity, vUv + vec2(-uPx.x * 2.0, uPx.y * 2.0)).xy;
+  fragColor = vec4(sum / 16.0, 0.0, 1.0);
+}`
+
+// 6) Render — v6.1：读模糊后的 velocity 场 → 3D Phong silk
+// 关键改进：render 读 velBlurred（已平滑），normal 采样更宽（5 像素）
 const FS_RENDER = `#version 300 es
 precision highp float;
 uniform sampler2D uVelocity;
@@ -283,9 +307,8 @@ float getH(vec2 uv) {
 }
 
 void main() {
-  // === 1. 速度场 → 高度场（中心 + 8 邻域平均 → 平滑 normal）===
-  // 步长 3 像素 = 更柔的 normal
-  float STEP = 3.0;
+  // === 1. 速度场 → 高度场（已 pre-blur，但 render 内部仍 9 点平均）===
+  float STEP = 5.0;  // v6: 加大到 5 像素 → normal 更平滑
   vec2 dx = vec2(uPx.x * STEP, 0.0);
   vec2 dy = vec2(0.0, uPx.y * STEP);
 
@@ -298,7 +321,7 @@ void main() {
      getH(vUv + dx - dy) + getH(vUv - dx - dy)) * 0.5
   ) / 12.0;
 
-  // Sobel 算 normal（更宽采样）
+  // Sobel normal
   float h_l = getH(vUv - dx);
   float h_r = getH(vUv + dx);
   float h_u = getH(vUv - dy);
@@ -312,44 +335,39 @@ void main() {
     (h_ru + 2.0 * h_r + h_rd) - (h_lu + 2.0 * h_l + h_ld),
     (h_ld + 2.0 * h_d + h_rd) - (h_lu + 2.0 * h_u + h_ru)
   );
-  // normal 坡度（1.8x = 强烈但不夸张）
-  normal = normalize(normal * 1.8 + vec2(0.00001));
+  // v6: 1.5x normal scale（之前 1.8x 偏强烈）
+  normal = normalize(normal * 1.5 + vec2(0.00001));
 
   // === 2. 多光源 ===
-  vec2 light1 = normalize(vec2(0.5, 0.7));   // 主光：右上
-  vec2 light2 = normalize(vec2(-0.4, -0.2));  // 补光：左下
+  vec2 light1 = normalize(vec2(0.5, 0.7));
+  vec2 light2 = normalize(vec2(-0.4, -0.2));
 
-  // Lambert + Half-Lambert 混合（避免纯黑，也有对比）
   float diff1 = max(0.0, dot(normal, light1));
-  float diffHalf = dot(normal, light1) * 0.5 + 0.5;  // 0-1
-  float diff2 = max(0.0, dot(normal, light2)) * 0.25;
+  float diff2 = max(0.0, dot(normal, light2));
 
-  // Blinn-Phong 高光（柔 + 亮）
+  // Blinn-Phong 高光
   vec2 viewDir = vec2(0.0, 1.0);
   vec2 half1 = normalize(light1 + viewDir);
   float spec1 = pow(max(0.0, dot(normal, half1)), 18.0);
   float spec2 = pow(max(0.0, dot(normal, normalize(light2 + viewDir))), 22.0) * 0.4;
   float spec = spec1 + spec2;
 
-  // === 3. 颜色合成 ===
+  // === 3. 颜色合成（v6.1: 调整为 byonlab 那种冷调中性色）===
   float lenv = clamp(h_c, 0.0, 1.0);
   lenv = pow(lenv, 0.5);
 
+  // palette（高对比灰白）
   vec3 paletteColor = texture(uPalette, vec2(lenv, 0.5)).rgb;
 
-  // 暗色：比 bg 略深（35% 暗）—— byonlab 那种深色
-  vec3 shadowColor = uBgColor.rgb * 0.65;
+  // 暗色：冷调灰（比 bg 略深 35% + 蓝色偏移）— byonlab 那种深色
+  vec3 coolShadow = uBgColor.rgb * vec3(0.50, 0.55, 0.65) + vec3(0.0, 0.0, 0.02);
+  // 中间用 palette 平滑过渡
+  vec3 litByDiff = mix(coolShadow, paletteColor, lenv);
 
-  // 关键：只在 lenv 大（silk 区域）才应用 3D 阴影，bg 区域保持原色
-  // 阴影权重 = lenv * 0.7（silk 边缘 70% 阴影强度，中心更亮）
+  // 关键：只在 lenv 大（silk 区域）才应用 3D 阴影
   float shadowWeight = lenv * 0.7;
-
-  // 漫反射：暗区（diff 小）→ shadow，亮区（diff 大）→ palette
-  vec3 litByDiff = mix(shadowColor, paletteColor, lenv);
-  // 用 diffHalf 进一步控制亮度（normals 朝向光 → 更亮）
   vec3 finalColor = mix(uBgColor.rgb, litByDiff * (0.7 + diff1 * 0.5), shadowWeight + 0.3);
-  // 加高光
-  finalColor += spec * 0.55 * lenv;
+  finalColor += spec * 0.5 * lenv;
 
   // alpha
   float alpha = mix(uBgColor.a, 1.0, lenv * 0.6 + spec * 0.4);
@@ -408,16 +426,17 @@ function resize() {
   initFBOs()
 }
 
-// byonlab 默认参数
+// byonlab 默认参数（v6 微调）
 const SIM_PARAMS = {
   dt: 0.014,
   iterations_poisson: 32,
-  mouse_force: 20,        // byonlab 默认 20
-  cursor_size: 0.2,       // NDC 空间，0.2 = 20% 屏幕宽度的刷子
-  isViscous: false,       // byonlab 默认 false（性能）
+  mouse_force: 20,
+  cursor_size: 0.3,       // v6: 0.2 → 0.3，1.5x 大 brush
+  isViscous: false,
+  velocity_drag: 0.998,   // v6.1: 调到 0.998（温和衰减）→ silk 还能保持
 }
 
-let vel, div, pressure, palette
+let vel, velBlurred, div, pressure, palette
 const programs = {}
 let quadVAO
 
@@ -427,6 +446,7 @@ function initPrograms() {
   programs.divergence = makeProgram(gl, VS_QUAD, FS_DIVERGENCE)
   programs.pressure = makeProgram(gl, VS_QUAD, FS_PRESSURE)
   programs.gradSub = makeProgram(gl, VS_QUAD, FS_GRADIENT_SUBTRACT)
+  programs.blur = makeProgram(gl, VS_QUAD, FS_BLUR)  // v6 新增
   programs.render = makeProgram(gl, VS_QUAD, FS_RENDER)
 }
 
@@ -436,6 +456,7 @@ function initFBOs() {
   const type = gl.HALF_FLOAT
   const param = gl.LINEAR
   vel = createDoubleFBO(gl, simW, simH, ifmt, fmt, type, param)
+  velBlurred = createFBO(gl, simW, simH, ifmt, fmt, type, param)  // v6
   const ifmtD = gl.R16F
   const fmtD = gl.RED
   div = createDoubleFBO(gl, simW, simH, ifmtD, fmtD, type, param)
@@ -587,19 +608,30 @@ function step() {
   gl.uniform2f(gl.getUniformLocation(programs.gradSub, 'uPx'),
     1.0 / vel.write.width, 1.0 / vel.write.height)
   gl.uniform1f(gl.getUniformLocation(programs.gradSub, 'uDt'), SIM_PARAMS.dt)
+  gl.uniform1f(gl.getUniformLocation(programs.gradSub, 'uDrag'), SIM_PARAMS.velocity_drag)
   drawPass(programs.gradSub, vel.write)
   vel.swap()
+
+  // 6) v6 抗碎纹关键：pre-blur velocity
+  // render 读 velBlurred 而不是 vel，silk 不会有高频颗粒
+  gl.useProgram(programs.blur)
+  vel.read.attach(0)
+  gl.uniform1i(gl.getUniformLocation(programs.blur, 'uVelocity'), 0)
+  gl.uniform2f(gl.getUniformLocation(programs.blur, 'uPx'),
+    1.0 / velBlurred.width, 1.0 / velBlurred.height)
+  drawPass(programs.blur, velBlurred)
 }
 
 function render() {
+  // v6: 读 velBlurred（已平滑）→ normal 平滑 → silk 无颗粒
   gl.useProgram(programs.render)
-  vel.read.attach(0)
+  velBlurred.attach(0)
   gl.activeTexture(gl.TEXTURE1)
   gl.bindTexture(gl.TEXTURE_2D, palette)
   gl.uniform1i(gl.getUniformLocation(programs.render, 'uVelocity'), 0)
   gl.uniform1i(gl.getUniformLocation(programs.render, 'uPalette'), 1)
   gl.uniform2f(gl.getUniformLocation(programs.render, 'uPx'),
-    1.0 / vel.read.width, 1.0 / vel.read.height)
+    1.0 / velBlurred.width, 1.0 / velBlurred.height)
   // bgColor 跟 CSS body 保持一致（#dfe3e9 = 223/255, 227/255, 233/255）
   gl.uniform4f(gl.getUniformLocation(programs.render, 'uBgColor'), 223/255, 227/255, 233/255, 1.0)
   gl.bindFramebuffer(gl.FRAMEBUFFER, null)
