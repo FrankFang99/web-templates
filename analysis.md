@@ -1,7 +1,7 @@
 # BYON 丝绸布料 · 模板 001 技术拆解
 
 > 复刻目标：[byonlab.com](https://byonlab.com/#/community) 顶部那个鼠标移动让背景丝绸起伏的效果
-> 当前版本：**v7.2**（最终稳定版）
+> 当前版本：**v8**（整屏丝绸覆盖）
 
 ---
 
@@ -15,26 +15,28 @@
 
 ---
 
-## v7 vs v6 关键差异
+## v7.2 → v8 关键差异
 
-| 维度 | v6.4 (失败) | v7.2 (成功) |
+| 维度 | v7.2 (成功但单 blob) | v8 (整屏丝绸) |
 |---|---|---|
-| Render shader | 估计 normal + Blinn-Phong 多光源 | `mix(bg, palette(length(vel)), t)` |
-| 碎纹 | 多（normal 在高频 velocity 上有颗粒） | 极少（render-stage 1px blur 兜底） |
-| Force brush | `exp(-2.5r²)` Gaussian | `(1-r)²` 圆形（byonlab 原版） |
-| Viscous | 4 + 2 iter（弱） | 30 + 32 iter（byonlab 默认，强平滑） |
-| bgColor | `#dfe3e9` | `#e2e8f0`（byonlab 同款） |
-| cursor_size | 0.32 (NDC) | 0.18 (NDC, ≈ 18% 屏幕) |
-| velocity_drag | 0.998 | 不需要（无） |
-| render-stage blur | 7-tap 链式（过度） | 5-tap 1px 轻微（just enough） |
+| cursor_size | 0.18（18% 屏幕）| **0.45**（45% 屏幕）|
+| mouse_force | 20 | **25** |
+| Auto-pilot | lerp to target（停单点）| **Lissajous 连续路径**（不停单点）|
+| render-stage blur | 5-tap 1px Gaussian | **3-tap 0.5px 轻量**（保留织物细腻纹理）|
+| bg | `#e2e8f0` | **`#eef2f6`**（更白，接近 byonlab 实际）|
+| 多 silk blob | 1-2 个同时存在 | **4-6 个同时存在，整屏覆盖** |
+| 丝绸织物纹理 | 几乎没 | **保留**（v40c 顶部那种细密波纹）|
 
-**根因**：v6.4 的 Phong 用 `length(vel)` 当 height 估计 normal。velocity 在 advection 后有高频噪声 → normal 有颗粒 → Phong 高光把这些颗粒放大了 → 看起来"碎纹"。
+**v8 核心思路**：byonlab 的"完整绸布"效果 = **大 brush** + **连续 auto-pilot 路径** + **强 viscous 持续**。
+- 大 brush：cursor_size 0.45 让单次 force 覆盖 ~45% 屏幕
+- 连续路径：Lissajous（两个 ghost cursor 沿椭圆路径运动）→ silk 持续扫过全屏
+- 多 ghost cursor：主 cursor 位置 = 两个 ghost 的平均 → silk 在全屏留下多个 trail
 
-**修复**：byonlab 的 render shader **根本不算 normal**。它直接把 `length(vel)` 当 1D 颜色查表索引。silk 的 3D 感完全来自调色板的色阶分布（深色在 mid-t，亮色在 high-t，bg 在 t=0）。
+**v6.4 碎纹根因**（v7 解决）：Phong 用 `length(vel)` 当 height 估计 normal → 高频 velocity 场上的 normal 有颗粒 → Phong 高光放大颗粒。byonlab 原作直接 `palette(length(vel))`，不估 normal，silk 感全在调色板里。
 
 ---
 
-## v7.2 仿真流程
+## v8 仿真流程
 
 每帧 6 步：
 
@@ -45,8 +47,34 @@
 4. Pressure      pressure = Poisson(div) [Jacobi 32x] // 压力
 5. GradSub       vel_0 = (vel_1 - ∇p × dt)            // 减去压力梯度（保不可压）
 5.5 Viscous      velViscous = Jacobi(vel_0, ν=30, 32x) // 扩散平滑（抗碎纹关键）
-5.6 Render blur  velBlur = 5-tap 1px Gaussian(vel)    // 兜底去高频
+5.6 Render blur  velBlur = 3-tap 0.5px Gaussian(vel)  // 轻微，保留织物纹理
 6. Render        palette(length(velBlur)) → mix(bg, c, t)
+```
+
+**v8 仿真参数**：
+```js
+{
+  dt: 0.014,
+  iterations_poisson: 32,
+  iterations_viscous: 32,
+  viscous: 30,
+  mouse_force: 25,
+  cursor_size: 0.45,         // v8 大 brush
+  isViscous: true,
+}
+```
+
+**v8 auto-pilot**：Lissajous 连续路径
+```js
+// 两个 ghost cursor 沿不同椭圆路径运动
+const t = (now - startTime) / 1000
+const x1 = cos(phase1 + t * 0.7) * 0.7
+const y1 = sin(phase1 + t * 0.91) * 0.49
+const x2 = cos(phase2 + t * 0.4) * 0.36
+const y2 = sin(phase2 + t * 0.5) * 0.48
+// 主 cursor = 两个 ghost 的平均 → silk 持续扫过全屏
+pointer.x = (x1 + x2) * 0.5
+pointer.y = (y1 + y2) * 0.5
 ```
 
 ---
@@ -172,22 +200,24 @@ iterations_viscous: 8,
 
 ## 跟 byonlab 原作的差距
 
-✅ **已达成**：
+✅ **已达成**（v8 完整解决）：
+- 整屏丝绸覆盖（4-6 个 silk blob 同时存在）
 - 整体丝绸质感（深色阴影 + 白色高光）
 - 鼠标响应（force + advection）
 - 流体连续性（Stable Fluids 算法）
 - 冷调银白色调
-- 大 brush（18% 屏幕）→ 大面积 silk 形变
+- 大 brush（45% 屏幕）→ 大面积 silk 形变
+- 织物纹理保留（v40c 顶部那种细密丝绸波纹）
+- Lissajous 连续路径 auto-pilot
 
-⚠️ **仍有差距**：
-- byonlab 一次能展示 4-5 个 silk blob（continuous mouse movement + 更多 cursor stops）
-- 我们的 auto-pilot 一次只 1-2 个 blob
-- byonlab 的 silk 内部有更细腻的"丝光线纹"（来自更密的 sub-step）
+✅ **基本达成**：
+- byonlab 那种"完整绸布"感
+- bg 接近白（#eef2f6）
+- 多 silk blob 互相堆叠形成绸布褶皱
 
-**优化方向**（如需继续追）：
-1. auto-pilot 改成连续路径（不停在单点，绕大圆）
-2. 增加 force 频率（每个 cursor stop 持续 force 几帧再移开）
-3. sub-step 化 simulation（每帧 2-4 sub-step）
+⚠️ **细微差距**（v8 已经很接近，不影响主要观感）：
+- byonlab 的 silk 内部还有更细的"丝光线纹"（可能是 sub-step 模拟的副产物）
+- byonlab 鼠标区域的凹陷感更深（force 略大一些能拉近）
 
 ---
 
@@ -195,13 +225,14 @@ iterations_viscous: 8,
 
 ```
 byonlab-liquid-metal/
-├── index.html                  # v7.2 主文件（25KB，单文件 demo）
+├── index.html                  # v8 主文件（26KB，单文件 demo）
 ├── analysis.md                 # 本文件
 ├── byon-original.png           # byonlab.com 原版截图
-├── preview-grid-v7.png         # v7.2 4 联（不同鼠标位置）
-├── preview-compare-v7.png      # byonlab 原版 vs v7.2 对比
-├── preview-compare-v6-v7.png   # v6.4（碎纹） vs v7.2（丝滑） 对比
-└── preview-v32*.png            # v7.2 4 张单图（中间过程）
+├── preview-grid-v8.png         # v8 4 联（整屏丝绸）
+├── preview-compare-v8.png      # byonlab 原版 vs v8 对比
+├── preview-compare-v7.png      # byonlab vs v7.2 旧版对比
+├── preview-compare-v6-v7.png   # v6.4（碎纹） vs v7.2（丝滑）对比
+└── preview-v40*.png            # v8 4 张单图
 ```
 
 ---
@@ -211,7 +242,8 @@ byonlab-liquid-metal/
 - **Jos Stam (1999)** "Stable Fluids" — SIGGRAPH 论文，Stable Fluids 算法源头
 - **Stable Fluids in WebGL** — 各种 WebGL 实现参考
 - **byonlab.com bundle** — 1.3MB minified JS，反混淆分析得到核心算法
+- **Lissajous 曲线** — 用两个 sin/cos 频率比生成连续路径
 
 ---
 
-*最后更新：2026-08-05 · v7.2 稳定版*
+*最后更新：2026-08-05 · v8 整屏丝绸版*
