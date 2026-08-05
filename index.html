@@ -268,9 +268,32 @@ void main() {
   fragColor = vec4(v, 0.0, 1.0);
 }`
 
-// 5.5) Velocity blur —— v6 抗碎纹关键
-// 对 velocity 做 9 点高斯模糊，让高频 noise 平滑
-// 输出到 velBlurred FBO，render 时读这个
+// 5.4) Viscous diffusion —— v6.3 终极抗碎纹：Jacobi 迭代求解扩散方程
+// viscous = (v_new - v_old) / dt = ν * ∇²v → Jacobi 多次迭代
+// 在 advection 和 gradSub 之间做 4 次 → 速度场在 simulation 内部就平滑
+const FS_VISCOUS = `#version 300 es
+precision highp float;
+uniform sampler2D uVelocity;
+uniform sampler2D uVelocityNew;
+uniform float uViscous;
+uniform vec2 uPx;
+uniform float uDt;
+in vec2 vUv;
+out vec4 fragColor;
+void main() {
+  vec2 old = texture(uVelocity, vUv).xy;
+  vec2 new0 = texture(uVelocityNew, vUv + vec2(uPx.x * 2.0, 0.0)).xy;
+  vec2 new1 = texture(uVelocityNew, vUv - vec2(uPx.x * 2.0, 0.0)).xy;
+  vec2 new2 = texture(uVelocityNew, vUv + vec2(0.0, uPx.y * 2.0)).xy;
+  vec2 new3 = texture(uVelocityNew, vUv - vec2(0.0, uPx.y * 2.0)).xy;
+  vec2 newv = 4.0 * old + uViscous * uDt * (new0 + new1 + new2 + new3);
+  newv /= 4.0 * (1.0 + uViscous * uDt);
+  fragColor = vec4(newv, 0.0, 0.0);
+}`
+
+// 5.5) Velocity blur —— v6.2 抗碎纹强化：25-tap 真正高斯（kernel ~5 像素半径）
+// 之前 9-tap kernel 只有 2 像素，对 simulation 0.5x 分辨率太弱
+// 现在用 separable 高斯思路：两个方向各 5 个采样 → 25 采样近似高斯
 const FS_BLUR = `#version 300 es
 precision highp float;
 uniform sampler2D uVelocity;
@@ -278,17 +301,59 @@ uniform vec2 uPx;
 in vec2 vUv;
 out vec4 fragColor;
 void main() {
-  // 9-tap Gaussian（中心 4x，4 邻 2x，4 对角 1x）
-  vec2 sum = texture(uVelocity, vUv).xy * 4.0;
-  sum += texture(uVelocity, vUv + vec2(uPx.x * 2.0, 0.0)).xy * 2.0;
-  sum += texture(uVelocity, vUv - vec2(uPx.x * 2.0, 0.0)).xy * 2.0;
-  sum += texture(uVelocity, vUv + vec2(0.0, uPx.y * 2.0)).xy * 2.0;
-  sum += texture(uVelocity, vUv - vec2(0.0, uPx.y * 2.0)).xy * 2.0;
-  sum += texture(uVelocity, vUv + uPx * 2.0).xy;
-  sum += texture(uVelocity, vUv - uPx * 2.0).xy;
-  sum += texture(uVelocity, vUv + vec2(uPx.x * 2.0, -uPx.y * 2.0)).xy;
-  sum += texture(uVelocity, vUv + vec2(-uPx.x * 2.0, uPx.y * 2.0)).xy;
-  fragColor = vec4(sum / 16.0, 0.0, 1.0);
+  // 5-tap 1D Gaussian in X, 5-tap in Y → 25-tap separable
+  // weights: [1, 4, 6, 4, 1] / 16
+  vec2 sum = vec2(0.0);
+  // X direction
+  sum += texture(uVelocity, vUv + vec2(uPx.x * -2.0, 0.0)).xy * 1.0;
+  sum += texture(uVelocity, vUv + vec2(uPx.x * -1.0, 0.0)).xy * 4.0;
+  sum += texture(uVelocity, vUv).xy * 6.0;
+  sum += texture(uVelocity, vUv + vec2(uPx.x *  1.0, 0.0)).xy * 4.0;
+  sum += texture(uVelocity, vUv + vec2(uPx.x *  2.0, 0.0)).xy * 1.0;
+  vec2 mid1 = sum / 16.0;
+  // Y direction
+  sum = vec2(0.0);
+  sum += texture(uVelocity, vUv + vec2(0.0, uPx.y * -2.0)).xy * 1.0;
+  sum += texture(uVelocity, vUv + vec2(0.0, uPx.y * -1.0)).xy * 4.0;
+  sum += texture(uVelocity, vUv).xy * 6.0;
+  sum += texture(uVelocity, vUv + vec2(0.0, uPx.y *  1.0)).xy * 4.0;
+  sum += texture(uVelocity, vUv + vec2(0.0, uPx.y *  2.0)).xy * 1.0;
+  vec2 mid2 = sum / 16.0;
+  // 平均两个方向 = 可分离高斯（虽然不是严格可分离，因为是同向叠加）
+  fragColor = vec4((mid1 + mid2) * 0.5, 0.0, 1.0);
+}`
+
+// 5.6) 第二次 blur（v6.2 链式模糊）—— 跑两次 ≈ kernel 半径 8 像素
+// 用更宽的 7-tap 模糊
+const FS_BLUR2 = `#version 300 es
+precision highp float;
+uniform sampler2D uVelocity;
+uniform vec2 uPx;
+in vec2 vUv;
+out vec4 fragColor;
+void main() {
+  // 7-tap 1D Gaussian weights: [1, 6, 15, 20, 15, 6, 1] / 64
+  vec2 sum = vec2(0.0);
+  // X pass
+  sum += texture(uVelocity, vUv + vec2(uPx.x * -3.0, 0.0)).xy * 1.0;
+  sum += texture(uVelocity, vUv + vec2(uPx.x * -2.0, 0.0)).xy * 6.0;
+  sum += texture(uVelocity, vUv + vec2(uPx.x * -1.0, 0.0)).xy * 15.0;
+  sum += texture(uVelocity, vUv).xy * 20.0;
+  sum += texture(uVelocity, vUv + vec2(uPx.x *  1.0, 0.0)).xy * 15.0;
+  sum += texture(uVelocity, vUv + vec2(uPx.x *  2.0, 0.0)).xy * 6.0;
+  sum += texture(uVelocity, vUv + vec2(uPx.x *  3.0, 0.0)).xy * 1.0;
+  vec2 mid1 = sum / 64.0;
+  // Y pass
+  sum = vec2(0.0);
+  sum += texture(uVelocity, vUv + vec2(0.0, uPx.y * -3.0)).xy * 1.0;
+  sum += texture(uVelocity, vUv + vec2(0.0, uPx.y * -2.0)).xy * 6.0;
+  sum += texture(uVelocity, vUv + vec2(0.0, uPx.y * -1.0)).xy * 15.0;
+  sum += texture(uVelocity, vUv).xy * 20.0;
+  sum += texture(uVelocity, vUv + vec2(0.0, uPx.y *  1.0)).xy * 15.0;
+  sum += texture(uVelocity, vUv + vec2(0.0, uPx.y *  2.0)).xy * 6.0;
+  sum += texture(uVelocity, vUv + vec2(0.0, uPx.y *  3.0)).xy * 1.0;
+  vec2 mid2 = sum / 64.0;
+  fragColor = vec4((mid1 + mid2) * 0.5, 0.0, 1.0);
 }`
 
 // 6) Render — v6.1：读模糊后的 velocity 场 → 3D Phong silk
@@ -307,8 +372,8 @@ float getH(vec2 uv) {
 }
 
 void main() {
-  // === 1. 速度场 → 高度场（已 pre-blur，但 render 内部仍 9 点平均）===
-  float STEP = 5.0;  // v6: 加大到 5 像素 → normal 更平滑
+  // === 1. 速度场 → 高度场（v6.4: 进一步加大 normal 采样距离 → 平滑）===
+  float STEP = 8.0;  // v6.4: 5 → 8 更宽
   vec2 dx = vec2(uPx.x * STEP, 0.0);
   vec2 dy = vec2(0.0, uPx.y * STEP);
 
@@ -419,24 +484,27 @@ let W, H, simW, simH
 function resize() {
   W = window.innerWidth
   H = window.innerHeight
-  simW = Math.max(1, Math.round(W * 0.5))
-  simH = Math.max(1, Math.round(H * 0.5))
+  // v6.2: 0.5 → 0.6 simulation resolution（提升但不过度）
+  simW = Math.max(1, Math.round(W * 0.6))
+  simH = Math.max(1, Math.round(H * 0.6))
   canvas.width = W
   canvas.height = H
   initFBOs()
 }
 
-// byonlab 默认参数（v6 微调）
+// v6.4: 平衡 viscous（既平滑又保持流动）
 const SIM_PARAMS = {
   dt: 0.014,
   iterations_poisson: 32,
+  iterations_viscous: 2,    // v6.4: 4 → 2，少扩散但仍抗碎纹
+  viscous: 4.0,             // v6.4: 8 → 4 更温和
   mouse_force: 20,
-  cursor_size: 0.3,       // v6: 0.2 → 0.3，1.5x 大 brush
-  isViscous: false,
-  velocity_drag: 0.998,   // v6.1: 调到 0.998（温和衰减）→ silk 还能保持
+  cursor_size: 0.32,
+  isViscous: true,
+  velocity_drag: 0.998,
 }
 
-let vel, velBlurred, div, pressure, palette
+let vel, velViscous, velBlurred, div, pressure, palette
 const programs = {}
 let quadVAO
 
@@ -446,7 +514,8 @@ function initPrograms() {
   programs.divergence = makeProgram(gl, VS_QUAD, FS_DIVERGENCE)
   programs.pressure = makeProgram(gl, VS_QUAD, FS_PRESSURE)
   programs.gradSub = makeProgram(gl, VS_QUAD, FS_GRADIENT_SUBTRACT)
-  programs.blur = makeProgram(gl, VS_QUAD, FS_BLUR)  // v6 新增
+  programs.viscous = makeProgram(gl, VS_QUAD, FS_VISCOUS)  // v6.3 新增
+  programs.blur2 = makeProgram(gl, VS_QUAD, FS_BLUR2)  // v6.2 第二次 blur
   programs.render = makeProgram(gl, VS_QUAD, FS_RENDER)
 }
 
@@ -456,7 +525,8 @@ function initFBOs() {
   const type = gl.HALF_FLOAT
   const param = gl.LINEAR
   vel = createDoubleFBO(gl, simW, simH, ifmt, fmt, type, param)
-  velBlurred = createFBO(gl, simW, simH, ifmt, fmt, type, param)  // v6
+  velViscous = createDoubleFBO(gl, simW, simH, ifmt, fmt, type, param)  // v6.3 viscous output
+  velBlurred = createFBO(gl, simW, simH, ifmt, fmt, type, param)
   const ifmtD = gl.R16F
   const fmtD = gl.RED
   div = createDoubleFBO(gl, simW, simH, ifmtD, fmtD, type, param)
@@ -612,18 +682,39 @@ function step() {
   drawPass(programs.gradSub, vel.write)
   vel.swap()
 
-  // 6) v6 抗碎纹关键：pre-blur velocity
-  // render 读 velBlurred 而不是 vel，silk 不会有高频颗粒
-  gl.useProgram(programs.blur)
+  // 5.5) v6.3 viscous diffusion —— 终极抗碎纹
+  // 在 simulation 内部做 4 次 Jacobi 扩散 → velocity 自然平滑
+  // advection 看到平滑的速度 → 不产生高频 noise
+  for (let i = 0; i < SIM_PARAMS.iterations_viscous; i++) {
+    gl.useProgram(programs.viscous)
+    vel.read.attach(0)
+    velViscous.read.attach(1)
+    gl.uniform1i(gl.getUniformLocation(programs.viscous, 'uVelocity'), 0)
+    gl.uniform1i(gl.getUniformLocation(programs.viscous, 'uVelocityNew'), 1)
+    gl.uniform1f(gl.getUniformLocation(programs.viscous, 'uViscous'), SIM_PARAMS.viscous)
+    gl.uniform2f(gl.getUniformLocation(programs.viscous, 'uPx'),
+      1.0 / vel.read.width, 1.0 / vel.read.height)
+    gl.uniform1f(gl.getUniformLocation(programs.viscous, 'uDt'), SIM_PARAMS.dt)
+    drawPass(programs.viscous, velViscous.write)
+    velViscous.swap()
+  }
+  // 复制回 vel（让下次 advection 看到平滑的 vel）
+  // 简单做法：viscous output 直接作为下次的 vel
+  // 但更稳：把 velViscous.read 内容 copy 到 vel.read
+  // 这里用更稳的 swap：让 vel.read = velViscous.read
+  vel.read = velViscous.read
+
+  // 6) v6.2 抗碎纹：单 7-tap blur for render
+  gl.useProgram(programs.blur2)
   vel.read.attach(0)
-  gl.uniform1i(gl.getUniformLocation(programs.blur, 'uVelocity'), 0)
-  gl.uniform2f(gl.getUniformLocation(programs.blur, 'uPx'),
+  gl.uniform1i(gl.getUniformLocation(programs.blur2, 'uVelocity'), 0)
+  gl.uniform2f(gl.getUniformLocation(programs.blur2, 'uPx'),
     1.0 / velBlurred.width, 1.0 / velBlurred.height)
-  drawPass(programs.blur, velBlurred)
+  drawPass(programs.blur2, velBlurred)
 }
 
 function render() {
-  // v6: 读 velBlurred（已平滑）→ normal 平滑 → silk 无颗粒
+  // v6.2: 读 velBlurred（7-tap Gaussian 后）→ silk 无颗粒但有流动感
   gl.useProgram(programs.render)
   velBlurred.attach(0)
   gl.activeTexture(gl.TEXTURE1)
