@@ -3,10 +3,10 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>BYON-style 流体丝绸 · 模板 001 v4</title>
+<title>BYON-style 流体丝绸 · 模板 001 v7</title>
 <style>
   :root {
-    --bg: #dfe3e9;
+    --bg: #e2e8f0;
     --text: #1a1d22;
     --text-muted: rgba(26, 29, 34, 0.55);
   }
@@ -65,14 +65,19 @@
 
 <script>
 /*
- * BYON-style 流体丝绸 · v4
- * 关键修复（vs v3）：
- *   1. FS_EXTERNAL_FORCE 用 uCenter（不再是 vUv-0.5）→ 力真正跟随鼠标
- *   2. Force pass 用 ADDITIVE BLENDING（blendFunc ONE, ONE）→ vel_1 += force
- *   3. Step 顺序修正：advect → force(add) → divergence → poisson → gradSub
- *   4. 跳过 viscous 迭代（byonlab 默认 isViscous=false）
- *   5. mouse_force = 20（byonlab 默认值）
- *   6. 真正的自动巡航：lerp 到随机目标 → 持续产生 P.diff → 持续 silk
+ * BYON-style 流体丝绸 · v7
+ *
+ * 核心改造（vs v6.4）：
+ *   1. 丢掉 Phong / normal 估计 / 3D 阴影整套 → 改用 byonlab 原版极简 render
+ *      gl_FragColor = mix(bgColor.rgb, palette(length(vel)), length(vel))
+ *      整个丝绸质感全部来自 palette 贴图
+ *   2. 丢掉的 3D 计算正是 v6.4 碎纹的根因：高频 velocity 场做 normal 估计 = 颗粒噪声
+ *   3. Force brush 改为 byonlab (1-r)² 圆形 brush（之前用 exp(-2.5r²) Gaussian 也算 OK，
+ *      但 (1-r)² 是 byonlab 用的形状，跟 simulation 更搭）
+ *   4. 仿真参数对齐 byonlab 默认：cursor_size 100, viscous 30, iterations_viscous 32
+ *   5. bgColor 改为 #e2e8f0（byonlab 同款冷调灰蓝）
+ *   6. 取消 simulation 后面的 render-stage blur（byonlab 没有）
+ *   7. Render 直接读 vel_0（simulation 输出的最终速度）
  *
  * 算法：Jos Stam (1999) "Stable Fluids" + BFECC
  * 数据：byonlab.com bundle (1.3MB) 反混淆分析
@@ -162,7 +167,7 @@ void main() {
   gl_Position = vec4(aPos, 0.0, 1.0);
 }`
 
-// 1) Advection (BFECC) — Jos Stam semi-Lagrangian
+// 1) Advection (BFECC) — Jos Stam semi-Lagrangian（保留 v6.4 同款）
 const FS_ADVECTION = `#version 300 es
 precision highp float;
 uniform sampler2D uVelocity;
@@ -193,8 +198,11 @@ void main() {
   }
 }`
 
-// 2) External force —— v6 修复：用 Gaussian falloff（exp(-r²)）替代 d*d
-// 旧 d*d 在 r=1 边界处是 hard edge；Gaussian 永远平滑，silk 不会出碎纹
+// 2) External force —— byonlab Pe class 风格：(1-r)² 圆形 brush
+// 关键：mesh 在 NDC 里以 (uCenter, uCenter) 为中心、(uScale, uScale) 为大小
+// brush 内距离 r=0 处力最大（d=1），r=1 处力为零（d=0），r>1 处 d=0
+// 力方向由 pointer delta 决定，幅度由 mouse_force 决定
+// 圆形 brush 比 Gaussian 略"硬"，但 byonlab 用的就是这个，效果证明 OK
 const FS_EXTERNAL_FORCE = `#version 300 es
 precision highp float;
 uniform vec2 uForce;
@@ -203,15 +211,18 @@ uniform vec2 uScale;
 in vec2 vUv;
 out vec4 fragColor;
 void main() {
+  // vUv 是 [0,1] 的全屏 UV，转成 NDC [-1,1]
   vec2 ndc = (vUv - 0.5) * 2.0;
-  vec2 offset = (ndc - uCenter) / max(uScale, vec2(0.0001));
-  float r2 = dot(offset, offset);
-  // Gaussian falloff: e^(-2.5*r²)，在 r=1 处约 8.2%，无 hard edge
-  float d = exp(-2.5 * r2);
-  fragColor = vec4(uForce * d, 0.0, 1.0);
+  // 转换到 brush 的 local space（按 uScale 归一化）
+  vec2 local = (ndc - uCenter) / max(uScale, vec2(0.0001));
+  float r = length(local);
+  // byonlab (1-r)² falloff
+  float d = 1.0 - min(r, 1.0);
+  d *= d;
+  fragColor = vec4(uForce * d, 0.0, 0.0);
 }`
 
-// 3) Divergence
+// 3) Divergence（v6.4 同款）
 const FS_DIVERGENCE = `#version 300 es
 precision highp float;
 uniform sampler2D uVelocity;
@@ -228,7 +239,7 @@ void main() {
   fragColor = vec4(div / uDt);
 }`
 
-// 4) Pressure (Jacobi)
+// 4) Pressure (Jacobi)（v6.4 同款）
 const FS_PRESSURE = `#version 300 es
 precision highp float;
 uniform sampler2D uPressure;
@@ -246,14 +257,13 @@ void main() {
   fragColor = vec4(newP);
 }`
 
-// 5) Pressure gradient subtract（v6: 加 velocity drag，防止高频累积）
+// 5) Pressure gradient subtract（v6.4 同款，去掉 drag）
 const FS_GRADIENT_SUBTRACT = `#version 300 es
 precision highp float;
 uniform sampler2D uPressure;
 uniform sampler2D uVelocity;
 uniform vec2 uPx;
 uniform float uDt;
-uniform float uDrag;  // v6: 每帧衰减（0.985）
 in vec2 vUv;
 out vec4 fragColor;
 void main() {
@@ -264,13 +274,11 @@ void main() {
   vec2 v = texture(uVelocity, vUv).xy;
   vec2 gradP = vec2(p0 - p1, p2 - p3) * 0.5;
   v = v - gradP * uDt;
-  v *= uDrag;  // v6 drag
   fragColor = vec4(v, 0.0, 1.0);
 }`
 
-// 5.4) Viscous diffusion —— v6.3 终极抗碎纹：Jacobi 迭代求解扩散方程
-// viscous = (v_new - v_old) / dt = ν * ∇²v → Jacobi 多次迭代
-// 在 advection 和 gradSub 之间做 4 次 → 速度场在 simulation 内部就平滑
+// 5.5) Viscous diffusion（Jacobi 迭代，byonlab ot class）
+// viscous 越大 → 越平滑；iterations_viscous 控制迭代次数
 const FS_VISCOUS = `#version 300 es
 precision highp float;
 uniform sampler2D uVelocity;
@@ -291,157 +299,54 @@ void main() {
   fragColor = vec4(newv, 0.0, 0.0);
 }`
 
-// 5.5) Velocity blur —— v6.2 抗碎纹强化：25-tap 真正高斯（kernel ~5 像素半径）
-// 之前 9-tap kernel 只有 2 像素，对 simulation 0.5x 分辨率太弱
-// 现在用 separable 高斯思路：两个方向各 5 个采样 → 25 采样近似高斯
-const FS_BLUR = `#version 300 es
+// 5.6) Render-stage tiny blur —— 5-tap 十字 blur
+// v7.1 中间还残留的微纹理（auto-pilot 路径的累加）→ 这一步彻底消除
+// blur 半径 = 1 sim 像素（很轻），目的不是抹平 silk 形态，只是去掉高频噪声
+const FS_RENDER_BLUR = `#version 300 es
 precision highp float;
 uniform sampler2D uVelocity;
 uniform vec2 uPx;
 in vec2 vUv;
 out vec4 fragColor;
 void main() {
-  // 5-tap 1D Gaussian in X, 5-tap in Y → 25-tap separable
-  // weights: [1, 4, 6, 4, 1] / 16
+  // 5-tap 1px Gaussian
   vec2 sum = vec2(0.0);
-  // X direction
-  sum += texture(uVelocity, vUv + vec2(uPx.x * -2.0, 0.0)).xy * 1.0;
-  sum += texture(uVelocity, vUv + vec2(uPx.x * -1.0, 0.0)).xy * 4.0;
-  sum += texture(uVelocity, vUv).xy * 6.0;
-  sum += texture(uVelocity, vUv + vec2(uPx.x *  1.0, 0.0)).xy * 4.0;
-  sum += texture(uVelocity, vUv + vec2(uPx.x *  2.0, 0.0)).xy * 1.0;
-  vec2 mid1 = sum / 16.0;
-  // Y direction
-  sum = vec2(0.0);
-  sum += texture(uVelocity, vUv + vec2(0.0, uPx.y * -2.0)).xy * 1.0;
-  sum += texture(uVelocity, vUv + vec2(0.0, uPx.y * -1.0)).xy * 4.0;
-  sum += texture(uVelocity, vUv).xy * 6.0;
-  sum += texture(uVelocity, vUv + vec2(0.0, uPx.y *  1.0)).xy * 4.0;
-  sum += texture(uVelocity, vUv + vec2(0.0, uPx.y *  2.0)).xy * 1.0;
-  vec2 mid2 = sum / 16.0;
-  // 平均两个方向 = 可分离高斯（虽然不是严格可分离，因为是同向叠加）
-  fragColor = vec4((mid1 + mid2) * 0.5, 0.0, 1.0);
+  sum += texture(uVelocity, vUv + vec2(uPx.x, 0.0)).xy * 1.0;
+  sum += texture(uVelocity, vUv - vec2(uPx.x, 0.0)).xy * 1.0;
+  sum += texture(uVelocity, vUv + vec2(0.0, uPx.y)).xy * 1.0;
+  sum += texture(uVelocity, vUv - vec2(0.0, uPx.y)).xy * 1.0;
+  sum += texture(uVelocity, vUv).xy * 4.0;
+  fragColor = vec4(sum / 8.0, 0.0, 1.0);
 }`
 
-// 5.6) 第二次 blur（v6.2 链式模糊）—— 跑两次 ≈ kernel 半径 8 像素
-// 用更宽的 7-tap 模糊
-const FS_BLUR2 = `#version 300 es
-precision highp float;
-uniform sampler2D uVelocity;
-uniform vec2 uPx;
-in vec2 vUv;
-out vec4 fragColor;
-void main() {
-  // 7-tap 1D Gaussian weights: [1, 6, 15, 20, 15, 6, 1] / 64
-  vec2 sum = vec2(0.0);
-  // X pass
-  sum += texture(uVelocity, vUv + vec2(uPx.x * -3.0, 0.0)).xy * 1.0;
-  sum += texture(uVelocity, vUv + vec2(uPx.x * -2.0, 0.0)).xy * 6.0;
-  sum += texture(uVelocity, vUv + vec2(uPx.x * -1.0, 0.0)).xy * 15.0;
-  sum += texture(uVelocity, vUv).xy * 20.0;
-  sum += texture(uVelocity, vUv + vec2(uPx.x *  1.0, 0.0)).xy * 15.0;
-  sum += texture(uVelocity, vUv + vec2(uPx.x *  2.0, 0.0)).xy * 6.0;
-  sum += texture(uVelocity, vUv + vec2(uPx.x *  3.0, 0.0)).xy * 1.0;
-  vec2 mid1 = sum / 64.0;
-  // Y pass
-  sum = vec2(0.0);
-  sum += texture(uVelocity, vUv + vec2(0.0, uPx.y * -3.0)).xy * 1.0;
-  sum += texture(uVelocity, vUv + vec2(0.0, uPx.y * -2.0)).xy * 6.0;
-  sum += texture(uVelocity, vUv + vec2(0.0, uPx.y * -1.0)).xy * 15.0;
-  sum += texture(uVelocity, vUv).xy * 20.0;
-  sum += texture(uVelocity, vUv + vec2(0.0, uPx.y *  1.0)).xy * 15.0;
-  sum += texture(uVelocity, vUv + vec2(0.0, uPx.y *  2.0)).xy * 6.0;
-  sum += texture(uVelocity, vUv + vec2(0.0, uPx.y *  3.0)).xy * 1.0;
-  vec2 mid2 = sum / 64.0;
-  fragColor = vec4((mid1 + mid2) * 0.5, 0.0, 1.0);
-}`
-
-// 6) Render — v6.1：读模糊后的 velocity 场 → 3D Phong silk
-// 关键改进：render 读 velBlurred（已平滑），normal 采样更宽（5 像素）
+// 6) Render —— v7 极简版：byonlab 原版，没有 Phong / normal
+// silk 感完全来自 palette 贴图和 bgColor 的搭配
+// 之前 v6.4 的 Phong 估计 normal 是碎纹根因
 const FS_RENDER = `#version 300 es
 precision highp float;
 uniform sampler2D uVelocity;
 uniform sampler2D uPalette;
 uniform vec4 uBgColor;
-uniform vec2 uPx;
 in vec2 vUv;
 out vec4 fragColor;
-
-float getH(vec2 uv) {
-  return length(texture(uVelocity, uv).xy);
-}
-
 void main() {
-  // === 1. 速度场 → 高度场（v6.4: 进一步加大 normal 采样距离 → 平滑）===
-  float STEP = 8.0;  // v6.4: 5 → 8 更宽
-  vec2 dx = vec2(uPx.x * STEP, 0.0);
-  vec2 dy = vec2(0.0, uPx.y * STEP);
-
-  // 9 点平均（更平滑的 h_c）
-  float h_c = (
-    getH(vUv) * 4.0 +
-    getH(vUv + dx) + getH(vUv - dx) +
-    getH(vUv + dy) + getH(vUv - dy) +
-    (getH(vUv + dx + dy) + getH(vUv - dx + dy) +
-     getH(vUv + dx - dy) + getH(vUv - dx - dy)) * 0.5
-  ) / 12.0;
-
-  // Sobel normal
-  float h_l = getH(vUv - dx);
-  float h_r = getH(vUv + dx);
-  float h_u = getH(vUv - dy);
-  float h_d = getH(vUv + dy);
-  float h_lu = getH(vUv - dx - dy);
-  float h_ru = getH(vUv + dx - dy);
-  float h_ld = getH(vUv - dx + dy);
-  float h_rd = getH(vUv + dx + dy);
-
-  vec2 normal = vec2(
-    (h_ru + 2.0 * h_r + h_rd) - (h_lu + 2.0 * h_l + h_ld),
-    (h_ld + 2.0 * h_d + h_rd) - (h_lu + 2.0 * h_u + h_ru)
-  );
-  // v6: 1.5x normal scale（之前 1.8x 偏强烈）
-  normal = normalize(normal * 1.5 + vec2(0.00001));
-
-  // === 2. 多光源 ===
-  vec2 light1 = normalize(vec2(0.5, 0.7));
-  vec2 light2 = normalize(vec2(-0.4, -0.2));
-
-  float diff1 = max(0.0, dot(normal, light1));
-  float diff2 = max(0.0, dot(normal, light2));
-
-  // Blinn-Phong 高光
-  vec2 viewDir = vec2(0.0, 1.0);
-  vec2 half1 = normalize(light1 + viewDir);
-  float spec1 = pow(max(0.0, dot(normal, half1)), 18.0);
-  float spec2 = pow(max(0.0, dot(normal, normalize(light2 + viewDir))), 22.0) * 0.4;
-  float spec = spec1 + spec2;
-
-  // === 3. 颜色合成（v6.1: 调整为 byonlab 那种冷调中性色）===
-  float lenv = clamp(h_c, 0.0, 1.0);
-  lenv = pow(lenv, 0.5);
-
-  // palette（高对比灰白）
-  vec3 paletteColor = texture(uPalette, vec2(lenv, 0.5)).rgb;
-
-  // 暗色：冷调灰（比 bg 略深 35% + 蓝色偏移）— byonlab 那种深色
-  vec3 coolShadow = uBgColor.rgb * vec3(0.50, 0.55, 0.65) + vec3(0.0, 0.0, 0.02);
-  // 中间用 palette 平滑过渡
-  vec3 litByDiff = mix(coolShadow, paletteColor, lenv);
-
-  // 关键：只在 lenv 大（silk 区域）才应用 3D 阴影
-  float shadowWeight = lenv * 0.7;
-  vec3 finalColor = mix(uBgColor.rgb, litByDiff * (0.7 + diff1 * 0.5), shadowWeight + 0.3);
-  finalColor += spec * 0.5 * lenv;
-
-  // alpha
-  float alpha = mix(uBgColor.a, 1.0, lenv * 0.6 + spec * 0.4);
-  fragColor = vec4(finalColor, alpha);
+  vec2 vel = texture(uVelocity, vUv).xy;
+  float lenv = clamp(length(vel), 0.0, 1.0);
+  vec3 c = texture(uPalette, vec2(lenv, 0.5)).rgb;
+  vec3 outRGB = mix(uBgColor.rgb, c, lenv);
+  float outA = mix(uBgColor.a, 1.0, lenv);
+  fragColor = vec4(outRGB, outA);
 }`
 
-// ========== 调色板：bg 灰 → 中亮 → 极亮白（高对比让 silk 可见）==========
+// ========== 调色板：byonlab 丝绸感 1D 渐变 ==========
+// 设计思路：
+//   - t=0.0  暗区（silk 阴影）：冷调深灰蓝
+//   - t=0.3  中间：稍亮的冷灰
+//   - t=0.6  浅色（silk 本体）：与 bg 接近的冷灰
+//   - t=1.0  高光：冷白（带极轻微蓝调）
+// 用 64 个 stop 平滑过渡 → 没有 banding
 function makePaletteTexture(gl) {
-  const W = 256
+  const W = 64
   const tex = gl.createTexture()
   gl.activeTexture(gl.TEXTURE0)
   gl.bindTexture(gl.TEXTURE_2D, tex)
@@ -449,25 +354,38 @@ function makePaletteTexture(gl) {
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+
+  // 4 段关键色：v7.1 调亮（之前太暗）→ 让 silk 明显但不碎
+  // 设计思路：mix(bg, palette(t), t) 公式下
+  //   t=0 时 → bg（最浅，几乎无 silk）
+  //   t=0.3 时 → bg 的 70% + dark 的 30%（可见阴影）
+  //   t=0.6 时 → 回到中间（silk body）
+  //   t=1.0 时 → 白（强烈高光）
+  // 这给屏幕一种"从浅到深再到白"的丝绸光泽感
+  const stops = [
+    { t: 0.00, rgb: [0.92, 0.94, 0.97] },   // 接近 bg（silk 边缘）
+    { t: 0.30, rgb: [0.30, 0.34, 0.42] },   // 深冷灰（silk 阴影，最暗处）
+    { t: 0.55, rgb: [0.55, 0.60, 0.70] },   // 中冷灰（silk 主体）
+    { t: 0.80, rgb: [0.85, 0.88, 0.92] },   // 浅冷灰（silk 亮区）
+    { t: 1.00, rgb: [0.99, 0.99, 1.00] },   // 冷白高光
+  ]
   const data = new Uint8Array(W * 4)
   for (let i = 0; i < W; i++) {
     const t = i / (W - 1)
-    // 高对比 3-stop：bg 灰(208) → 中银(235) → 极亮(255)
-    let r, g, b
-    if (t < 0.5) {
-      const k = t / 0.5
-      r = 208 + (235 - 208) * k
-      g = 212 + (238 - 212) * k
-      b = 218 + (243 - 218) * k
-    } else {
-      const k = (t - 0.5) / 0.5
-      r = 235 + (255 - 235) * k
-      g = 238 + (255 - 238) * k
-      b = 243 + (255 - 243) * k
+    // 找两段插值
+    let a = stops[0], b = stops[stops.length - 1]
+    for (let s = 0; s < stops.length - 1; s++) {
+      if (t >= stops[s].t && t <= stops[s + 1].t) {
+        a = stops[s]; b = stops[s + 1]; break
+      }
     }
-    data[i*4] = r
-    data[i*4+1] = g
-    data[i*4+2] = b
+    const k = (t - a.t) / Math.max(0.0001, b.t - a.t)
+    const r = a.rgb[0] + (b.rgb[0] - a.rgb[0]) * k
+    const g = a.rgb[1] + (b.rgb[1] - a.rgb[1]) * k
+    const bl = a.rgb[2] + (b.rgb[2] - a.rgb[2]) * k
+    data[i*4]   = Math.round(r * 255)
+    data[i*4+1] = Math.round(g * 255)
+    data[i*4+2] = Math.round(bl * 255)
     data[i*4+3] = 255
   }
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, W, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, data)
@@ -484,24 +402,23 @@ let W, H, simW, simH
 function resize() {
   W = window.innerWidth
   H = window.innerHeight
-  // v6.2: 0.5 → 0.6 simulation resolution（提升但不过度）
-  simW = Math.max(1, Math.round(W * 0.6))
-  simH = Math.max(1, Math.round(H * 0.6))
+  // v7: 0.5 resolution（byonlab 默认）
+  simW = Math.max(1, Math.round(W * 0.5))
+  simH = Math.max(1, Math.round(H * 0.5))
   canvas.width = W
   canvas.height = H
   initFBOs()
 }
 
-// v6.4: 平衡 viscous（既平滑又保持流动）
+// v7: 对齐 byonlab 默认参数
 const SIM_PARAMS = {
   dt: 0.014,
   iterations_poisson: 32,
-  iterations_viscous: 2,    // v6.4: 4 → 2，少扩散但仍抗碎纹
-  viscous: 4.0,             // v6.4: 8 → 4 更温和
-  mouse_force: 20,
-  cursor_size: 0.32,
-  isViscous: true,
-  velocity_drag: 0.998,
+  iterations_viscous: 32,    // byonlab 默认
+  viscous: 30,              // byonlab 默认（比 v6.4 的 4 高很多）
+  mouse_force: 20,          // byonlab 默认
+  cursor_size: 0.18,        // NDC 单位，约屏幕 18%（对应 byonlab 100/simW ≈ 0.15-0.2）
+  isViscous: true,          // v7 开启 viscous（v6.4 试过）—— 这是 byonlab 默认的"高粘度模式"
 }
 
 let vel, velViscous, velBlurred, div, pressure, palette
@@ -514,8 +431,8 @@ function initPrograms() {
   programs.divergence = makeProgram(gl, VS_QUAD, FS_DIVERGENCE)
   programs.pressure = makeProgram(gl, VS_QUAD, FS_PRESSURE)
   programs.gradSub = makeProgram(gl, VS_QUAD, FS_GRADIENT_SUBTRACT)
-  programs.viscous = makeProgram(gl, VS_QUAD, FS_VISCOUS)  // v6.3 新增
-  programs.blur2 = makeProgram(gl, VS_QUAD, FS_BLUR2)  // v6.2 第二次 blur
+  programs.viscous = makeProgram(gl, VS_QUAD, FS_VISCOUS)
+  programs.renderBlur = makeProgram(gl, VS_QUAD, FS_RENDER_BLUR)  // v7.2 微纹理消除
   programs.render = makeProgram(gl, VS_QUAD, FS_RENDER)
 }
 
@@ -525,8 +442,8 @@ function initFBOs() {
   const type = gl.HALF_FLOAT
   const param = gl.LINEAR
   vel = createDoubleFBO(gl, simW, simH, ifmt, fmt, type, param)
-  velViscous = createDoubleFBO(gl, simW, simH, ifmt, fmt, type, param)  // v6.3 viscous output
-  velBlurred = createFBO(gl, simW, simH, ifmt, fmt, type, param)
+  velViscous = createDoubleFBO(gl, simW, simH, ifmt, fmt, type, param)
+  velBlurred = createFBO(gl, simW, simH, ifmt, fmt, type, param)  // v7.2 render 前 blur
   const ifmtD = gl.R16F
   const fmtD = gl.RED
   div = createDoubleFBO(gl, simW, simH, ifmtD, fmtD, type, param)
@@ -540,18 +457,15 @@ resize()
 window.addEventListener('resize', resize)
 
 // ========== 鼠标 + 自动巡航 ==========
-// NDC 空间 [-1, 1]，byonlab 风格
 const pointer = {
-  x: 0.5, y: 0.5,        // 当前目标位置（NDC）
-  prevX: 0.5, prevY: 0.5, // 上一帧位置
-  dx: 0, dy: 0,           // delta (NDC)
-  userActive: false,      // 用户是否在操作
+  x: 0.5, y: 0.5,
+  prevX: 0.5, prevY: 0.5,
+  dx: 0, dy: 0,
+  userActive: false,
   lastUserTime: 0,
-  // 自动巡航
   autoTarget: { x: 0, y: 0 },
   autoActive: false,
   autoStartTime: 0,
-  autoRampMs: 1500,
 }
 
 function setMouseFromClient(clientX, clientY) {
@@ -559,6 +473,7 @@ function setMouseFromClient(clientX, clientY) {
   pointer.y = -((clientY / H) * 2 - 1)
   pointer.userActive = true
   pointer.lastUserTime = performance.now()
+  pointer.autoActive = false
 }
 
 window.addEventListener('mousemove', (e) => {
@@ -570,14 +485,10 @@ window.addEventListener('touchmove', (e) => {
   }
 }, { passive: true })
 
-// 自动巡航：1.5s 用户无操作 → 开始自动旋转
 function startAutoPilot() {
   pointer.autoActive = true
-  pointer.autoStartTime = performance.now()
-  // 随机选一个目标点
-  const m = 0.7  // margin
-  pointer.autoTarget.x = (Math.random() * 2 - 1) * m
-  pointer.autoTarget.y = (Math.random() * 2 - 1) * m
+  pointer.autoTarget.x = (Math.random() * 2 - 1) * 0.7
+  pointer.autoTarget.y = (Math.random() * 2 - 1) * 0.7
 }
 
 function updateAutoPilot(now) {
@@ -585,10 +496,9 @@ function updateAutoPilot(now) {
     startAutoPilot()
   }
   if (pointer.autoActive) {
-    // lerp 0.04 速度比 byonlab 默认 0.015 快一点 → silk 更明显
-    pointer.x += (pointer.autoTarget.x - pointer.x) * 0.04
-    pointer.y += (pointer.autoTarget.y - pointer.y) * 0.04
-    // 接近目标 → 选新目标
+    // byonlab 速度：~0.015 lerp → silk 持续产生
+    pointer.x += (pointer.autoTarget.x - pointer.x) * 0.02
+    pointer.y += (pointer.autoTarget.y - pointer.y) * 0.02
     const dx = pointer.autoTarget.x - pointer.x
     const dy = pointer.autoTarget.y - pointer.y
     if (Math.sqrt(dx*dx + dy*dy) < 0.05) {
@@ -623,28 +533,22 @@ function step() {
   gl.uniform2f(gl.getUniformLocation(programs.advection, 'uFboSize'), vel.read.width, vel.read.height)
   drawPass(programs.advection, vel.write)
   vel.swap()
-  // 现在 vel.read 包含 advect 后的速度
 
-  // 2) External force —— ADDITIVE BLEND：vel.read += force * d
+  // 2) External force —— ADDITIVE BLEND：vel.read += force * d²
   gl.useProgram(programs.force)
-  vel.read.attach(0)
-  gl.uniform1i(gl.getUniformLocation(programs.force, 'uVelocity'), 0)
-  // byonlab 用 P.diff/2 * mouse_force，但实际效果偏小；这里 *2 让 silk 更明显
   gl.uniform2f(gl.getUniformLocation(programs.force, 'uForce'),
-    pointer.dx * SIM_PARAMS.mouse_force * 2.0,
-    pointer.dy * SIM_PARAMS.mouse_force * 2.0)
+    pointer.dx * SIM_PARAMS.mouse_force,
+    pointer.dy * SIM_PARAMS.mouse_force)
   gl.uniform2f(gl.getUniformLocation(programs.force, 'uCenter'), pointer.x, pointer.y)
   gl.uniform2f(gl.getUniformLocation(programs.force, 'uScale'),
     SIM_PARAMS.cursor_size, SIM_PARAMS.cursor_size)
   gl.bindFramebuffer(gl.FRAMEBUFFER, vel.read.fbo)
   gl.viewport(0, 0, vel.read.width, vel.read.height)
-  gl.useProgram(programs.force)
   gl.bindVertexArray(quadVAO)
   gl.enable(gl.BLEND)
   gl.blendFunc(gl.ONE, gl.ONE)
   gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0)
   gl.disable(gl.BLEND)
-  // vel.read 现在 = advect + force
 
   // 3) Divergence(vel.read) → div.write
   gl.useProgram(programs.divergence)
@@ -669,7 +573,7 @@ function step() {
     pressure.swap()
   }
 
-  // 5) Pressure gradient subtract: vel.write = vel.read - gradP
+  // 5) Pressure gradient subtract: vel.write = vel.read - gradP * dt
   gl.useProgram(programs.gradSub)
   pressure.read.attach(0)
   vel.read.attach(1)
@@ -678,13 +582,12 @@ function step() {
   gl.uniform2f(gl.getUniformLocation(programs.gradSub, 'uPx'),
     1.0 / vel.write.width, 1.0 / vel.write.height)
   gl.uniform1f(gl.getUniformLocation(programs.gradSub, 'uDt'), SIM_PARAMS.dt)
-  gl.uniform1f(gl.getUniformLocation(programs.gradSub, 'uDrag'), SIM_PARAMS.velocity_drag)
   drawPass(programs.gradSub, vel.write)
   vel.swap()
 
-  // 5.5) v6.3 viscous diffusion —— 终极抗碎纹
-  // 在 simulation 内部做 4 次 Jacobi 扩散 → velocity 自然平滑
-  // advection 看到平滑的速度 → 不产生高频 noise
+  // 5.5) Viscous diffusion (byonlab ot class)：在 gradSub 之后做扩散
+  // 高 viscous 值 + 多 iterations = 速度场被强平滑 → render 时没有高频 noise
+  // 这是抗碎纹的关键（替代 v6.4 的 render-stage blur）
   for (let i = 0; i < SIM_PARAMS.iterations_viscous; i++) {
     gl.useProgram(programs.viscous)
     vel.read.attach(0)
@@ -698,33 +601,31 @@ function step() {
     drawPass(programs.viscous, velViscous.write)
     velViscous.swap()
   }
-  // 复制回 vel（让下次 advection 看到平滑的 vel）
-  // 简单做法：viscous output 直接作为下次的 vel
-  // 但更稳：把 velViscous.read 内容 copy 到 vel.read
-  // 这里用更稳的 swap：让 vel.read = velViscous.read
+  // 把 viscous 的结果当作下次的 input
+  // 注意：这里直接绑到 vel.read（用 assign 而不是 swap，因为 vel 还在别处用）
   vel.read = velViscous.read
-
-  // 6) v6.2 抗碎纹：单 7-tap blur for render
-  gl.useProgram(programs.blur2)
-  vel.read.attach(0)
-  gl.uniform1i(gl.getUniformLocation(programs.blur2, 'uVelocity'), 0)
-  gl.uniform2f(gl.getUniformLocation(programs.blur2, 'uPx'),
-    1.0 / velBlurred.width, 1.0 / velBlurred.height)
-  drawPass(programs.blur2, velBlurred)
 }
 
 function render() {
-  // v6.2: 读 velBlurred（7-tap Gaussian 后）→ silk 无颗粒但有流动感
+  // v7.2: render-stage 5-tap blur 1px → 消除 auto-pilot 路径的微纹理
+  // blur 很轻（仅 1 sim 像素），silk 形态完全保留
+  gl.useProgram(programs.renderBlur)
+  vel.read.attach(0)
+  gl.uniform1i(gl.getUniformLocation(programs.renderBlur, 'uVelocity'), 0)
+  gl.uniform2f(gl.getUniformLocation(programs.renderBlur, 'uPx'),
+    1.0 / vel.read.width, 1.0 / vel.read.height)
+  drawPass(programs.renderBlur, velBlurred)
+
+  // 用 velBlurred 做 palette lookup
   gl.useProgram(programs.render)
   velBlurred.attach(0)
   gl.activeTexture(gl.TEXTURE1)
   gl.bindTexture(gl.TEXTURE_2D, palette)
   gl.uniform1i(gl.getUniformLocation(programs.render, 'uVelocity'), 0)
   gl.uniform1i(gl.getUniformLocation(programs.render, 'uPalette'), 1)
-  gl.uniform2f(gl.getUniformLocation(programs.render, 'uPx'),
-    1.0 / velBlurred.width, 1.0 / velBlurred.height)
-  // bgColor 跟 CSS body 保持一致（#dfe3e9 = 223/255, 227/255, 233/255）
-  gl.uniform4f(gl.getUniformLocation(programs.render, 'uBgColor'), 223/255, 227/255, 233/255, 1.0)
+  // bgColor: byonlab 同款 #e2e8f0（冷调灰蓝）
+  gl.uniform4f(gl.getUniformLocation(programs.render, 'uBgColor'),
+    0xE2 / 255, 0xE8 / 255, 0xF0 / 255, 1.0)
   gl.bindFramebuffer(gl.FRAMEBUFFER, null)
   gl.viewport(0, 0, W, H)
   gl.bindVertexArray(quadVAO)
